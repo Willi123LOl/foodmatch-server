@@ -9,8 +9,6 @@ app.use(cors());
 app.use(express.json());
 
 const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
-
-// In-Memory Lobbies
 const lobbies = new Map();
 
 function calculateDistance(lat1, lon1, lat2, lon2) {
@@ -25,20 +23,19 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// Erkennung von Merkmalen für den dynamischen Akinator
 function analyzeRestaurantFeatures(name, types, address) {
-  const text = `${name} ${types.join(' ')} ${address}`.toLowerCase();
+  const text = `${name} ${(types || []).join(' ')} ${address}`.toLowerCase();
   return {
-    isFingerfood: text.includes('burger') || text.includes('döner') || text.includes('kebab') || text.includes('pizza') || text.includes('fast_food') || text.includes('sandwich') || text.includes('snack'),
-    isAsian: text.includes('asia') || text.includes('sushi') || text.includes('vietnam') || text.includes('thai') || text.includes('china') || text.includes('wok') || text.includes('ramen'),
-    isItalian: text.includes('pizza') || text.includes('pasta') || text.includes('italien') || text.includes('trattoria'),
-    isHeavyMeat: text.includes('steak') || text.includes('grill') || text.includes('burger') || text.includes('döner') || text.includes('bbq') || text.includes('fleisch'),
-    isLightHealthy: text.includes('bowl') || text.includes('salad') || text.includes('salat') || text.includes('vegan') || text.includes('veggie') || text.includes('cafe'),
-    isCozySitDown: !text.includes('fast_food') && !text.includes('imbiss') && !text.includes('takeaway')
+    isFingerfood: text.includes('burger') || text.includes('döner') || text.includes('kebab') || text.includes('pizza') || text.includes('fast_food') || text.includes('sandwich') || text.includes('chicken') || text.includes('imbiss'),
+    isAsian: text.includes('asia') || text.includes('sushi') || text.includes('vietnam') || text.includes('thai') || text.includes('china') || text.includes('wok') || text.includes('ramen') || text.includes('japanese') || text.includes('asian'),
+    isItalian: text.includes('pizza') || text.includes('pasta') || text.includes('italien') || text.includes('trattoria') || text.includes('ristorante'),
+    isHeavyMeat: text.includes('steak') || text.includes('grill') || text.includes('burger') || text.includes('döner') || text.includes('bbq') || text.includes('chicken') || text.includes('fleisch') || text.includes('schnitzel'),
+    isLightHealthy: text.includes('bowl') || text.includes('salad') || text.includes('salat') || text.includes('vegan') || text.includes('veggie') || text.includes('sushi') || text.includes('cafe'),
+    isCozySitDown: !text.includes('fast_food') && !text.includes('imbiss') && !text.includes('takeaway') && !text.includes('snack')
   };
 }
 
-// 1. Google Places (New) Autocomplete
+// Autocomplete
 app.post('/api/autocomplete', async (req, res) => {
   try {
     const { input, lat, lon } = req.body;
@@ -49,11 +46,8 @@ app.post('/api/autocomplete', async (req, res) => {
       languageCode: 'de',
       includedRegionCodes: ['de']
     };
-
     if (lat && lon) {
-      payload.locationBias = {
-        circle: { center: { latitude: lat, longitude: lon }, radius: 30000.0 }
-      };
+      payload.locationBias = { circle: { center: { latitude: lat, longitude: lon }, radius: 30000.0 } };
     }
 
     const response = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
@@ -61,7 +55,6 @@ app.post('/api/autocomplete', async (req, res) => {
       headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GOOGLE_API_KEY },
       body: JSON.stringify(payload)
     });
-
     const data = await response.json();
     const predictions = (data.suggestions || [])
       .filter(s => s.placePrediction)
@@ -74,14 +67,13 @@ app.post('/api/autocomplete', async (req, res) => {
           description: p.text?.text || ''
         };
       });
-
     res.json({ predictions });
   } catch (err) {
     res.json({ predictions: [] });
   }
 });
 
-// 2. Place Details Geocoding
+// Geocode Place
 app.post('/api/geocode-place', async (req, res) => {
   try {
     const { placeId } = req.body;
@@ -92,7 +84,6 @@ app.post('/api/geocode-place', async (req, res) => {
         'X-Goog-FieldMask': 'id,displayName,formattedAddress,location'
       }
     });
-
     const data = await response.json();
     if (data.location) {
       return res.json({
@@ -107,7 +98,7 @@ app.post('/api/geocode-place', async (req, res) => {
   }
 });
 
-// 3. Reverse Geocode für GPS
+// Reverse Geocode
 app.post('/api/reverse-geocode', async (req, res) => {
   try {
     const { lat, lon } = req.body;
@@ -122,31 +113,56 @@ app.post('/api/reverse-geocode', async (req, res) => {
   }
 });
 
-// 4. Restaurants abrufen (Places API New mit Puffer-Radius bis 25km)
+// Multi-Batch-Suche: Lädt bis zu 60+ Restaurants über mehrere Typen
 async function fetchRestaurantsFromGoogle(lat, lon, radiusKm = 20) {
   const radiusMeters = Math.min(Math.round(radiusKm * 1000), 25000);
-  const payload = {
-    includedTypes: ['restaurant', 'meal_takeaway', 'fast_food_restaurant', 'pizza_restaurant', 'bar', 'cafe'],
-    maxResultCount: 20,
-    locationRestriction: {
-      circle: { center: { latitude: lat, longitude: lon }, radius: radiusMeters }
-    }
-  };
 
-  const response = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Goog-Api-Key': GOOGLE_API_KEY,
-      'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.priceLevel,places.primaryTypeDisplayName,places.types,places.regularOpeningHours,places.parkingOptions'
-    },
-    body: JSON.stringify(payload)
+  // Wir fragen 3 Typen-Gruppen parallel ab, um mehr Vielfalt & bis zu 60 Treffer zu bekommen
+  const typeGroups = [
+    ['restaurant'],
+    ['japanese_restaurant', 'sushi_restaurant', 'asian_restaurant'],
+    ['fast_food_restaurant', 'pizza_restaurant', 'bar']
+  ];
+
+  const fetchPromises = typeGroups.map(async (types) => {
+    try {
+      const payload = {
+        includedTypes: types,
+        maxResultCount: 20,
+        locationRestriction: {
+          circle: { center: { latitude: lat, longitude: lon }, radius: radiusMeters }
+        }
+      };
+      const res = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': GOOGLE_API_KEY,
+          'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.priceLevel,places.primaryTypeDisplayName,places.types,places.regularOpeningHours,places.parkingOptions'
+        },
+        body: JSON.stringify(payload)
+      });
+      const d = await res.json();
+      return d.places || [];
+    } catch (e) {
+      return [];
+    }
   });
 
-  const data = await response.json();
-  if (!data.places) return [];
+  const allBatches = await Promise.all(fetchPromises);
+  const seenIds = new Set();
+  const combined = [];
 
-  return data.places.map((p) => {
+  for (const batch of allBatches) {
+    for (const p of batch) {
+      if (!seenIds.has(p.id)) {
+        seenIds.add(p.id);
+        combined.push(p);
+      }
+    }
+  }
+
+  return combined.map((p) => {
     const pLat = p.location?.latitude || lat;
     const pLon = p.location?.longitude || lon;
 
@@ -173,7 +189,7 @@ async function fetchRestaurantsFromGoogle(lat, lon, radiusKm = 20) {
       address: p.formattedAddress || 'Adresse in der Nähe',
       rating: p.rating || 0,
       price: priceTag,
-      numericPrice: numericPrice, // 1 = €, 2 = €€, 3 = €€€
+      numericPrice: numericPrice,
       cuisine: p.primaryTypeDisplayName?.text || 'Restaurant',
       dist: calculateDistance(lat, lon, pLat, pLon),
       lat: pLat,
@@ -197,22 +213,35 @@ app.post('/api/restaurants', async (req, res) => {
   }
 });
 
-// Dynamischer Fragen-Generator basierend auf dem echten Pool
+// Dynamischer Fragen-Generator basierend auf tatsächlichem Inhalt
 function generateDynamicQuestions(pool) {
   const questions = [];
   const total = pool.length;
   if (total === 0) return questions;
 
-  const countFingerfood = pool.filter(r => r.features?.isFingerfood).length;
   const countAsian = pool.filter(r => r.features?.isAsian).length;
+  const countFingerfood = pool.filter(r => r.features?.isFingerfood).length;
   const countHeavyMeat = pool.filter(r => r.features?.isHeavyMeat).length;
   const countSitDown = pool.filter(r => r.features?.isCozySitDown).length;
 
-  // 1. Spaltung Fingerfood vs Besteck
+  // Wenn Asiaten/Sushi vorhanden sind, Frage anbieten
+  if (countAsian > 0) {
+    questions.push({
+      id: 'asian',
+      title: "Lust auf asiatische Küche oder Sushi?",
+      subtitle: "Reis, Nudeln, Sushi, Wok oder Currys.",
+      options: [
+        { text: "🥢 Ja, definitiv Asiatisch / Sushi", feature: 'isAsian', targetVal: true, isHard: true },
+        { text: "🥖 Nein, lieber europäisch / andere Richtungen", feature: 'isAsian', targetVal: false, isHard: false },
+        { text: "🤷 Egal, bin für alles offen", feature: null }
+      ]
+    });
+  }
+
   if (countFingerfood > 0 && countFingerfood < total) {
     questions.push({
       id: 'fingerfood',
-      title: "Auf die Hand oder mit Besteck?",
+      title: "Auf die Hand oder mit Besteck am Tisch?",
       subtitle: "Der Akinator analysiert das Ess-Erlebnis.",
       options: [
         { text: "🍔 Auf die Faust (Burger, Döner, Pizza, Snacks)", feature: 'isFingerfood', targetVal: true },
@@ -222,22 +251,7 @@ function generateDynamicQuestions(pool) {
     });
   }
 
-  // 2. Asiatisch vs Rest
-  if (countAsian > 0 && countAsian < total) {
-    questions.push({
-      id: 'asian',
-      title: "Lust auf asiatische Aromen?",
-      subtitle: "Reis, Nudeln, Sushi, Wok oder Currys.",
-      options: [
-        { text: "🥢 Ja, definitiv Asiatisch (Sushi, Wok, Thai)", feature: 'isAsian', targetVal: true },
-        { text: "🥖 Nein, lieber Westlich / Klassisch", feature: 'isAsian', targetVal: false },
-        { text: "🤷 Offen für beides", feature: null }
-      ]
-    });
-  }
-
-  // 3. Deftig/Fleisch vs Leicht
-  if (countHeavyMeat > 0 && countHeavyMeat < total) {
+  if (countHeavyMeat > 0 && countHeavyMeat < total && questions.length < 3) {
     questions.push({
       id: 'meat',
       title: "Darf es so richtig deftig sein?",
@@ -250,7 +264,6 @@ function generateDynamicQuestions(pool) {
     });
   }
 
-  // 4. Sit-Down Atmosphäre
   if (countSitDown > 0 && countSitDown < total && questions.length < 4) {
     questions.push({
       id: 'sitdown',
@@ -267,7 +280,6 @@ function generateDynamicQuestions(pool) {
   return questions.slice(0, 4);
 }
 
-// Endpunkt: Dynamische Fragen für den aktuellen Pool anfordern
 app.post('/api/akinator/questions', (req, res) => {
   const { pool } = req.body;
   const questions = generateDynamicQuestions(pool || []);
@@ -281,8 +293,7 @@ app.post('/api/lobby/create', async (req, res) => {
     const code = Math.floor(1000 + Math.random() * 9000).toString();
 
     const raw = await fetchRestaurantsFromGoogle(lat, lon, 25);
-    
-    // Maximale Preisstufe: '€' => 1, '€€' => 2, '€€€' => 3
+
     let maxNumericPrice = 3;
     if (price === '€') maxNumericPrice = 1;
     else if (price === '€€') maxNumericPrice = 2;
@@ -362,17 +373,31 @@ app.post('/api/lobby/submit', (req, res) => {
 
   const allReady = lobby.participants.every(part => part.ready);
   if (allReady && lobby.restaurants.length > 0) {
-    let best = lobby.restaurants[0];
+    let pool = [...lobby.restaurants];
+
+    // HARTER Filter: Wenn gewünscht, fliegen unpassende komplett raus!
+    lobby.participants.forEach(part => {
+      part.answers.forEach(ans => {
+        if (ans && ans.isHard && ans.feature) {
+          const matchingOnly = pool.filter(r => r.features && r.features[ans.feature] === ans.targetVal);
+          if (matchingOnly.length > 0) {
+            pool = matchingOnly;
+          }
+        }
+      });
+    });
+
+    let best = pool[0];
     let highestScore = -9999;
 
-    lobby.restaurants.forEach(rest => {
-      let score = (rest.rating || 3.5) * 3 - rest.dist * 0.3;
+    pool.forEach(rest => {
+      let score = (rest.rating || 3.5) * 3 - rest.dist * 0.2;
 
       lobby.participants.forEach(part => {
         part.answers.forEach(ans => {
           if (!ans || !ans.feature) return;
           const match = rest.features && rest.features[ans.feature] === ans.targetVal;
-          if (match) score += 5;
+          if (match) score += 6;
           else score -= 4;
         });
       });
@@ -391,4 +416,4 @@ app.post('/api/lobby/submit', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`FoodMatch läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`FoodMatch Multi-Batch läuft auf Port ${PORT}`));
