@@ -22,87 +22,117 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// 1. Endpunkt: Adresse zu Koordinaten auflösen (Reverse Geocoding & Textsuche)
-app.post('/api/geocode', async (req, res) => {
+// 1. Google Places Live Autocomplete (während des Tippens)
+app.post('/api/autocomplete', async (req, res) => {
   try {
-    const { lat, lon, query } = req.body;
-    let url = '';
+    const { input, lat, lon } = req.body;
+    if (!input || input.trim().length < 2) {
+      return res.json({ predictions: [] });
+    }
 
-    if (query) {
-      url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&key=${GOOGLE_API_KEY}&language=de`;
-    } else if (lat && lon) {
-      url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lon}&key=${GOOGLE_API_KEY}&language=de`;
-    } else {
-      return res.status(400).json({ error: 'Parameter fehlen' });
+    let url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&key=${GOOGLE_API_KEY}&language=de&components=country:de`;
+    if (lat && lon) {
+      url += `&location=${lat},${lon}&radius=20000`;
     }
 
     const response = await fetch(url);
     const data = await response.json();
 
-    if (data.results && data.results.length > 0) {
-      const top = data.results[0];
-      return res.json({
-        address: top.formatted_address,
-        lat: top.geometry.location.lat,
-        lon: top.geometry.location.lng
-      });
-    }
+    const predictions = (data.predictions || []).map(p => ({
+      placeId: p.place_id,
+      mainText: p.structured_formatting?.main_text || p.description,
+      secondaryText: p.structured_formatting?.secondary_text || '',
+      description: p.description
+    }));
 
-    res.json({ address: 'Unbekannter Ort', lat, lon });
+    res.json({ predictions });
   } catch (err) {
-    console.error('Geocode Error:', err);
-    res.status(500).json({ error: 'Geocoding fehlgeschlagen' });
+    console.error('Autocomplete Error:', err);
+    res.json({ predictions: [] });
   }
 });
 
-// 2. Endpunkt: Restaurants abrufen (stabil ohne blockierende Timeouts)
+// 2. Place Details / Geocode (Wandelt ausgewählten Vorschlag in Lat/Lon um)
+app.post('/api/geocode-place', async (req, res) => {
+  try {
+    const { placeId } = req.body;
+    if (!placeId) return res.status(400).json({ error: 'placeId fehlt' });
+
+    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=geometry,formatted_address&key=${GOOGLE_API_KEY}&language=de`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.result) {
+      return res.json({
+        address: data.result.formatted_address,
+        lat: data.result.geometry.location.lat,
+        lon: data.result.geometry.location.lng
+      });
+    }
+    res.status(404).json({ error: 'Ort nicht gefunden' });
+  } catch (err) {
+    res.status(500).json({ error: 'Fehler' });
+  }
+});
+
+// 3. Reverse Geocode für GPS
+app.post('/api/reverse-geocode', async (req, res) => {
+  try {
+    const { lat, lon } = req.body;
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lon}&key=${GOOGLE_API_KEY}&language=de`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.results && data.results.length > 0) {
+      return res.json({ address: data.results[0].formatted_address });
+    }
+    res.json({ address: 'Aktueller Standort' });
+  } catch (err) {
+    res.json({ address: 'Aktueller Standort' });
+  }
+});
+
+// 4. Restaurants abrufen (Fallback-resistent)
 app.post('/api/restaurants', async (req, res) => {
   try {
     const { lat, lon, radiusKm = 3 } = req.body;
+    if (!lat || !lon) return res.status(400).json({ error: 'Koordinaten fehlen.' });
 
-    if (!lat || !lon) {
-      return res.status(400).json({ error: 'Koordinaten fehlen.' });
-    }
-
-    const radiusMeters = Math.min(radiusKm * 1000, 25000);
+    const radiusMeters = Math.min(Math.round(radiusKm * 1000), 25000);
     const placesUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lon}&radius=${radiusMeters}&type=restaurant&key=${GOOGLE_API_KEY}&language=de`;
 
     const response = await fetch(placesUrl);
     const data = await response.json();
 
+    console.log(`Google API Antwort Status: ${data.status} | Treffer: ${data.results?.length || 0}`);
+
     if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
-      console.error('Google API Status:', data.status, data.error_message);
-      return res.status(200).json({ restaurants: [] });
+      return res.json({ restaurants: [], apiStatus: data.status, apiError: data.error_message });
     }
 
     const results = data.results || [];
-
-    const restaurants = results.map((p) => {
-      // Bestimme geschätzte Rest-Öffnungszeit anhand des Google Status
+    const restaurants = results.map(p => {
       const isOpen = p.opening_hours?.open_now ?? true;
-
-      // Filtert Typen für eine lesbare Küche
-      const ignoredTypes = ['restaurant', 'food', 'point_of_interest', 'establishment'];
-      const rawCuisine = (p.types || []).find(t => !ignoredTypes.includes(t)) || 'Restaurant';
-      const formattedCuisine = rawCuisine.replace(/_/g, ' ');
+      const ignored = ['restaurant', 'food', 'point_of_interest', 'establishment'];
+      const rawCuisine = (p.types || []).find(t => !ignored.includes(t)) || 'Restaurant';
 
       return {
         id: p.place_id,
         name: p.name,
-        address: p.vicinity || 'Adresse in der Nähe',
+        address: p.vicinity || 'Adresse vor Ort',
         rating: p.rating || 0,
         price: p.price_level ? '€'.repeat(p.price_level) : '€€',
-        cuisine: formattedCuisine.charAt(0).toUpperCase() + formattedCuisine.slice(1),
+        cuisine: rawCuisine.replace(/_/g, ' ').toUpperCase(),
         dist: calculateDistance(lat, lon, p.geometry.location.lat, p.geometry.location.lng),
         lat: p.geometry.location.lat,
         lon: p.geometry.location.lng,
         isOpenNow: isOpen,
-        openMinutesRemaining: isOpen ? 180 : 0, // Fallback für Restzeit
-        hasParking: p.types ? (p.types.includes('shopping_mall') || p.rating >= 4.2) : true // Verlässlicher Parking-Indikator
+        openMinutesRemaining: isOpen ? 120 : 0,
+        hasParking: p.rating >= 4.0 || (p.types && p.types.includes('shopping_mall'))
       };
     });
 
-    res.json({ restaurants });
+    res.json({ restaurants, apiStatus: 'OK' });
   } catch (error) {
     console.error('Server Error:', error);
     res.status(500).json({ error: 'Serverfehler' });
@@ -110,6 +140,4 @@ app.post('/api/restaurants', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`FoodMatch läuft auf Port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server läuft auf Port ${PORT}`));
