@@ -22,7 +22,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// 1. Google Places Live Autocomplete (während des Tippens)
+// 1. Places API (New) - Autocomplete für Standortsuche
 app.post('/api/autocomplete', async (req, res) => {
   try {
     const { input, lat, lon } = req.body;
@@ -30,52 +30,87 @@ app.post('/api/autocomplete', async (req, res) => {
       return res.json({ predictions: [] });
     }
 
-    let url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&key=${GOOGLE_API_KEY}&language=de&components=country:de`;
+    const payload = {
+      input: input.trim(),
+      languageCode: 'de',
+      includedRegionCodes: ['de']
+    };
+
     if (lat && lon) {
-      url += `&location=${lat},${lon}&radius=20000`;
+      payload.locationBias = {
+        circle: {
+          center: { latitude: lat, longitude: lon },
+          radius: 30000.0
+        }
+      };
     }
 
-    const response = await fetch(url);
-    const data = await response.json();
+    const response = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': GOOGLE_API_KEY
+      },
+      body: JSON.stringify(payload)
+    });
 
-    const predictions = (data.predictions || []).map(p => ({
-      placeId: p.place_id,
-      mainText: p.structured_formatting?.main_text || p.description,
-      secondaryText: p.structured_formatting?.secondary_text || '',
-      description: p.description
-    }));
+    const data = await response.json();
+    if (!data.suggestions) {
+      console.log('Autocomplete Antwort:', data);
+      return res.json({ predictions: [] });
+    }
+
+    const predictions = data.suggestions
+      .filter(s => s.placePrediction)
+      .map(s => {
+        const p = s.placePrediction;
+        return {
+          placeId: p.placeId,
+          mainText: p.structuredFormat?.mainText?.text || p.text?.text || '',
+          secondaryText: p.structuredFormat?.secondaryText?.text || '',
+          description: p.text?.text || ''
+        };
+      });
 
     res.json({ predictions });
   } catch (err) {
-    console.error('Autocomplete Error:', err);
+    console.error('Autocomplete Fehler:', err);
     res.json({ predictions: [] });
   }
 });
 
-// 2. Place Details / Geocode (Wandelt ausgewählten Vorschlag in Lat/Lon um)
+// 2. Places API (New) - Details für gewählten Ort abrufen
 app.post('/api/geocode-place', async (req, res) => {
   try {
     const { placeId } = req.body;
     if (!placeId) return res.status(400).json({ error: 'placeId fehlt' });
 
-    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=geometry,formatted_address&key=${GOOGLE_API_KEY}&language=de`;
-    const response = await fetch(url);
-    const data = await response.json();
+    const url = `https://places.googleapis.com/v1/places/${placeId}?languageCode=de`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': GOOGLE_API_KEY,
+        'X-Goog-FieldMask': 'id,displayName,formattedAddress,location'
+      }
+    });
 
-    if (data.result) {
+    const data = await response.json();
+    if (data.location) {
       return res.json({
-        address: data.result.formatted_address,
-        lat: data.result.geometry.location.lat,
-        lon: data.result.geometry.location.lng
+        address: data.formattedAddress || data.displayName?.text,
+        lat: data.location.latitude,
+        lon: data.location.longitude
       });
     }
-    res.status(404).json({ error: 'Ort nicht gefunden' });
+
+    res.status(404).json({ error: 'Ort nicht aufgelöst' });
   } catch (err) {
-    res.status(500).json({ error: 'Fehler' });
+    res.status(500).json({ error: 'Geocode-Place Fehler' });
   }
 });
 
-// 3. Reverse Geocode für GPS
+// 3. Reverse Geocode (GPS Koordinate -> Text)
 app.post('/api/reverse-geocode', async (req, res) => {
   try {
     const { lat, lon } = req.body;
@@ -92,47 +127,77 @@ app.post('/api/reverse-geocode', async (req, res) => {
   }
 });
 
-// 4. Restaurants abrufen (Fallback-resistent)
+// 4. Places API (New) - Nearby Search für Restaurants
 app.post('/api/restaurants', async (req, res) => {
   try {
     const { lat, lon, radiusKm = 3 } = req.body;
     if (!lat || !lon) return res.status(400).json({ error: 'Koordinaten fehlen.' });
 
     const radiusMeters = Math.min(Math.round(radiusKm * 1000), 25000);
-    const placesUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lon}&radius=${radiusMeters}&type=restaurant&key=${GOOGLE_API_KEY}&language=de`;
 
-    const response = await fetch(placesUrl);
+    const payload = {
+      includedTypes: ['restaurant', 'meal_takeaway', 'fast_food_restaurant', 'pizza_restaurant', 'bar'],
+      maxResultCount: 20,
+      locationRestriction: {
+        circle: {
+          center: { latitude: lat, longitude: lon },
+          radius: radiusMeters
+        }
+      }
+    };
+
+    const response = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': GOOGLE_API_KEY,
+        'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.priceLevel,places.primaryTypeDisplayName,places.regularOpeningHours,places.parkingOptions'
+      },
+      body: JSON.stringify(payload)
+    });
+
     const data = await response.json();
+    console.log('Places API (New) Treffer:', data.places ? data.places.length : 0);
 
-    console.log(`Google API Antwort Status: ${data.status} | Treffer: ${data.results?.length || 0}`);
-
-    if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
-      return res.json({ restaurants: [], apiStatus: data.status, apiError: data.error_message });
+    if (!data.places || data.places.length === 0) {
+      return res.json({ restaurants: [] });
     }
 
-    const results = data.results || [];
-    const restaurants = results.map(p => {
-      const isOpen = p.opening_hours?.open_now ?? true;
-      const ignored = ['restaurant', 'food', 'point_of_interest', 'establishment'];
-      const rawCuisine = (p.types || []).find(t => !ignored.includes(t)) || 'Restaurant';
+    const restaurants = data.places.map((p) => {
+      const pLat = p.location?.latitude || lat;
+      const pLon = p.location?.longitude || lon;
+
+      let priceTag = '€€';
+      if (p.priceLevel === 'PRICE_LEVEL_INEXPENSIVE') priceTag = '€';
+      else if (p.priceLevel === 'PRICE_LEVEL_MODERATE') priceTag = '€€';
+      else if (p.priceLevel === 'PRICE_LEVEL_EXPENSIVE' || p.priceLevel === 'PRICE_LEVEL_VERY_EXPENSIVE') priceTag = '€€€';
+
+      // Prüfe Öffnungszeiten & Parkplatzoptionen der neuen API
+      const isOpen = p.regularOpeningHours?.openNow ?? true;
+      const hasParking = Boolean(
+        p.parkingOptions?.freeParkingLot ||
+        p.parkingOptions?.paidParkingLot ||
+        p.parkingOptions?.freeStreetParking ||
+        (p.rating && p.rating >= 4.0)
+      );
 
       return {
-        id: p.place_id,
-        name: p.name,
-        address: p.vicinity || 'Adresse vor Ort',
+        id: p.id,
+        name: p.displayName?.text || 'Restaurant',
+        address: p.formattedAddress || 'Adresse in der Nähe',
         rating: p.rating || 0,
-        price: p.price_level ? '€'.repeat(p.price_level) : '€€',
-        cuisine: rawCuisine.replace(/_/g, ' ').toUpperCase(),
-        dist: calculateDistance(lat, lon, p.geometry.location.lat, p.geometry.location.lng),
-        lat: p.geometry.location.lat,
-        lon: p.geometry.location.lng,
+        price: priceTag,
+        cuisine: p.primaryTypeDisplayName?.text || 'Restaurant',
+        dist: calculateDistance(lat, lon, pLat, pLon),
+        lat: pLat,
+        lon: pLon,
         isOpenNow: isOpen,
         openMinutesRemaining: isOpen ? 120 : 0,
-        hasParking: p.rating >= 4.0 || (p.types && p.types.includes('shopping_mall'))
+        hasParking: hasParking
       };
     });
 
-    res.json({ restaurants, apiStatus: 'OK' });
+    res.json({ restaurants });
   } catch (error) {
     console.error('Server Error:', error);
     res.status(500).json({ error: 'Serverfehler' });
@@ -140,4 +205,4 @@ app.post('/api/restaurants', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`FoodMatch läuft mit Places API (New) auf Port ${PORT}`));
