@@ -30,7 +30,7 @@ function analyzeRestaurantFeatures(name, types, address) {
   const text = `${name} ${(types || []).join(' ')} ${address}`.toLowerCase();
   return {
     isFingerfood: text.includes('burger') || text.includes('döner') || text.includes('kebab') || text.includes('pizza') || text.includes('fast_food') || text.includes('sandwich') || text.includes('chicken') || text.includes('imbiss'),
-    isAsian: text.includes('asia') || text.includes('sushi') || text.includes('vietnam') || text.includes('thai') || text.includes('china') || text.includes('wok') || text.includes('ramen') || text.includes('japanese') || text.includes('asian'),
+    isAsian: text.includes('asia') || text.includes('sushi') || text.includes('vietnam') || text.includes('thai') || text.includes('china') || text.includes('wok') || text.includes('ramen') || text.includes('japanese') || text.includes('asian') || text.includes('chinese') || text.includes('vietnamese'),
     isItalian: text.includes('pizza') || text.includes('pasta') || text.includes('italien') || text.includes('trattoria') || text.includes('ristorante'),
     isHeavyMeat: text.includes('steak') || text.includes('grill') || text.includes('burger') || text.includes('döner') || text.includes('bbq') || text.includes('chicken') || text.includes('fleisch') || text.includes('schnitzel'),
     isLightHealthy: text.includes('bowl') || text.includes('salad') || text.includes('salat') || text.includes('vegan') || text.includes('veggie') || text.includes('sushi') || text.includes('cafe'),
@@ -38,7 +38,7 @@ function analyzeRestaurantFeatures(name, types, address) {
   };
 }
 
-// ================= USER & FREUNDES-SYSTEM =================
+// ================= USER & FREUNDE =================
 
 // Nutzer registrieren / Ping
 app.post('/api/user/sync', (req, res) => {
@@ -63,6 +63,26 @@ app.post('/api/user/sync', (req, res) => {
   });
 });
 
+// Nutzer-Suche (Live-Autocomplete während des Tippens)
+app.get('/api/user/search', (req, res) => {
+  const query = (req.query.q || '').trim().toLowerCase();
+  const currentUser = (req.query.me || '').trim().toLowerCase();
+
+  if (!query || query.length < 1) {
+    return res.json({ users: [] });
+  }
+
+  const matched = [];
+  for (const [name] of users.entries()) {
+    if (name.toLowerCase().includes(query) && name.toLowerCase() !== currentUser) {
+      matched.push(name);
+      if (matched.length >= 8) break;
+    }
+  }
+
+  res.json({ users: matched });
+});
+
 // Freund hinzufügen
 app.post('/api/user/add-friend', (req, res) => {
   const { userName, friendName } = req.body;
@@ -72,8 +92,9 @@ app.post('/api/user/add-friend', (req, res) => {
   if (!uName || !fName) return res.status(400).json({ error: 'Name fehlt' });
   if (uName.toLowerCase() === fName.toLowerCase()) return res.status(400).json({ error: 'Du kannst dich nicht selbst hinzufügen.' });
 
+  // Falls Freund noch nicht im Speicher ist, legen wir ihn an
   if (!users.has(fName)) {
-    return res.status(404).json({ error: `Nutzer "${fName}" wurde nicht gefunden. Stelle sicher, dass er die App einmal geöffnet hat.` });
+    users.set(fName, { name: fName, friends: [], activeInvite: null, lastSeen: Date.now() });
   }
 
   const user = users.get(uName);
@@ -100,14 +121,14 @@ app.post('/api/lobby/invite', (req, res) => {
   res.json({ success: true });
 });
 
-// Einladung annehmen / ablehnen
+// Einladung beantworten
 app.post('/api/lobby/respond-invite', (req, res) => {
   const { userName, accept } = req.body;
   const u = users.get((userName || '').trim());
   if (!u) return res.status(404).json({ error: 'Nutzer nicht gefunden' });
 
   const invite = u.activeInvite;
-  u.activeInvite = null; // Zurücksetzen
+  u.activeInvite = null;
 
   if (accept && invite) {
     const lobby = lobbies.get(invite.lobbyCode);
@@ -197,12 +218,15 @@ app.post('/api/reverse-geocode', async (req, res) => {
   }
 });
 
+// Garantiert valide Google Places Typen (keine 400er Fehler mehr!)
 async function fetchRestaurantsFromGoogle(lat, lon, radiusKm = 20) {
   const radiusMeters = Math.min(Math.round(radiusKm * 1000), 25000);
+
+  // Valide offizielle Typen der neuen API
   const typeGroups = [
     ['restaurant'],
-    ['japanese_restaurant', 'sushi_restaurant', 'asian_restaurant'],
-    ['fast_food_restaurant', 'pizza_restaurant', 'bar']
+    ['meal_takeaway', 'fast_food_restaurant', 'pizza_restaurant', 'bar'],
+    ['cafe', 'bakery']
   ];
 
   const fetchPromises = typeGroups.map(async (types) => {
@@ -234,7 +258,7 @@ async function fetchRestaurantsFromGoogle(lat, lon, radiusKm = 20) {
 
   for (const batch of allBatches) {
     for (const p of batch) {
-      if (!seenIds.has(p.id)) {
+      if (p && p.id && !seenIds.has(p.id)) {
         seenIds.add(p.id);
         combined.push(p);
       }
@@ -363,7 +387,7 @@ app.post('/api/akinator/questions', (req, res) => {
   res.json({ questions });
 });
 
-// ================= LOBBY LOGIK =================
+// ================= LOBBY =================
 
 app.post('/api/lobby/create', async (req, res) => {
   try {
@@ -490,4 +514,4 @@ app.post('/api/lobby/submit', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`FoodMatch läuft mit Freundesliste auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`FoodMatch läuft auf Port ${PORT}`));
