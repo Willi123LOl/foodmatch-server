@@ -12,7 +12,7 @@ const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 // In-Memory Speicher
 const lobbies = new Map();
-const users = new Map(); // userName -> { name, friends: [], activeInvite: null, lastSeen: Date }
+const users = new Map();
 
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371;
@@ -38,9 +38,48 @@ function analyzeRestaurantFeatures(name, types, address) {
   };
 }
 
+// ================= TEST & DIAGNOSE ROUTE =================
+app.get('/api/test', async (req, res) => {
+  try {
+    const hasKey = Boolean(GOOGLE_API_KEY && GOOGLE_API_KEY.length > 10);
+    const keyPreview = hasKey ? `${GOOGLE_API_KEY.substring(0, 6)}...${GOOGLE_API_KEY.substring(GOOGLE_API_KEY.length - 4)}` : 'NICHT GESETZT';
+
+    // Test-Anfrage an Places API (New) für Bottrop
+    const payload = {
+      includedTypes: ['restaurant'],
+      maxResultCount: 5,
+      locationRestriction: {
+        circle: { center: { latitude: 51.5234, longitude: 6.9288 }, radius: 3000.0 }
+      }
+    };
+
+    const response = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': GOOGLE_API_KEY || '',
+        'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const googleStatus = response.status;
+    const googleData = await response.json();
+
+    res.json({
+      serverOnline: true,
+      hasApiKey: hasKey,
+      keyPreview: keyPreview,
+      googleHttpStatus: googleStatus,
+      googleResponse: googleData
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================= USER & FREUNDE =================
 
-// Nutzer registrieren / Ping
 app.post('/api/user/sync', (req, res) => {
   const { userName } = req.body;
   if (!userName) return res.status(400).json({ error: 'Name fehlt' });
@@ -63,14 +102,11 @@ app.post('/api/user/sync', (req, res) => {
   });
 });
 
-// Nutzer-Suche (Live-Autocomplete während des Tippens)
 app.get('/api/user/search', (req, res) => {
   const query = (req.query.q || '').trim().toLowerCase();
   const currentUser = (req.query.me || '').trim().toLowerCase();
 
-  if (!query || query.length < 1) {
-    return res.json({ users: [] });
-  }
+  if (!query) return res.json({ users: [] });
 
   const matched = [];
   for (const [name] of users.entries()) {
@@ -79,11 +115,9 @@ app.get('/api/user/search', (req, res) => {
       if (matched.length >= 8) break;
     }
   }
-
   res.json({ users: matched });
 });
 
-// Freund hinzufügen
 app.post('/api/user/add-friend', (req, res) => {
   const { userName, friendName } = req.body;
   const uName = (userName || '').trim();
@@ -92,7 +126,6 @@ app.post('/api/user/add-friend', (req, res) => {
   if (!uName || !fName) return res.status(400).json({ error: 'Name fehlt' });
   if (uName.toLowerCase() === fName.toLowerCase()) return res.status(400).json({ error: 'Du kannst dich nicht selbst hinzufügen.' });
 
-  // Falls Freund noch nicht im Speicher ist, legen wir ihn an
   if (!users.has(fName)) {
     users.set(fName, { name: fName, friends: [], activeInvite: null, lastSeen: Date.now() });
   }
@@ -105,23 +138,19 @@ app.post('/api/user/add-friend', (req, res) => {
   res.json({ success: true, friends: user.friends });
 });
 
-// Freund zu Lobby einladen
 app.post('/api/lobby/invite', (req, res) => {
   const { hostName, friendName, lobbyCode } = req.body;
   const f = users.get((friendName || '').trim());
-
-  if (!f) return res.status(404).json({ error: 'Freund existiert nicht.' });
+  if (!f) return res.status(404).json({ error: 'Freund nicht gefunden.' });
 
   f.activeInvite = {
     hostName: hostName.trim(),
     lobbyCode: lobbyCode.trim(),
     timestamp: Date.now()
   };
-
   res.json({ success: true });
 });
 
-// Einladung beantworten
 app.post('/api/lobby/respond-invite', (req, res) => {
   const { userName, accept } = req.body;
   const u = users.get((userName || '').trim());
@@ -159,7 +188,7 @@ app.post('/api/autocomplete', async (req, res) => {
 
     const response = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GOOGLE_API_KEY },
+      headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GOOGLE_API_KEY || '' },
       body: JSON.stringify(payload)
     });
     const data = await response.json();
@@ -186,7 +215,7 @@ app.post('/api/geocode-place', async (req, res) => {
     const response = await fetch(`https://places.googleapis.com/v1/places/${placeId}?languageCode=de`, {
       headers: {
         'Content-Type': 'application/json',
-        'X-Goog-Api-Key': GOOGLE_API_KEY,
+        'X-Goog-Api-Key': GOOGLE_API_KEY || '',
         'X-Goog-FieldMask': 'id,displayName,formattedAddress,location'
       }
     });
@@ -207,7 +236,7 @@ app.post('/api/geocode-place', async (req, res) => {
 app.post('/api/reverse-geocode', async (req, res) => {
   try {
     const { lat, lon } = req.body;
-    const response = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lon}&key=${GOOGLE_API_KEY}&language=de`);
+    const response = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lon}&key=${GOOGLE_API_KEY || ''}&language=de`);
     const data = await response.json();
     if (data.results && data.results.length > 0) {
       return res.json({ address: data.results[0].formatted_address });
@@ -218,54 +247,32 @@ app.post('/api/reverse-geocode', async (req, res) => {
   }
 });
 
-// Garantiert valide Google Places Typen (keine 400er Fehler mehr!)
 async function fetchRestaurantsFromGoogle(lat, lon, radiusKm = 20) {
   const radiusMeters = Math.min(Math.round(radiusKm * 1000), 25000);
 
-  // Valide offizielle Typen der neuen API
-  const typeGroups = [
-    ['restaurant'],
-    ['meal_takeaway', 'fast_food_restaurant', 'pizza_restaurant', 'bar'],
-    ['cafe', 'bakery']
-  ];
+  const payload = {
+    includedTypes: ['restaurant', 'meal_takeaway', 'fast_food_restaurant', 'pizza_restaurant', 'bar', 'cafe'],
+    maxResultCount: 20,
+    locationRestriction: { circle: { center: { latitude: lat, longitude: lon }, radius: radiusMeters } }
+  };
 
-  const fetchPromises = typeGroups.map(async (types) => {
-    try {
-      const payload = {
-        includedTypes: types,
-        maxResultCount: 20,
-        locationRestriction: { circle: { center: { latitude: lat, longitude: lon }, radius: radiusMeters } }
-      };
-      const res = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Goog-Api-Key': GOOGLE_API_KEY,
-          'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.priceLevel,places.primaryTypeDisplayName,places.types,places.regularOpeningHours,places.parkingOptions'
-        },
-        body: JSON.stringify(payload)
-      });
-      const d = await res.json();
-      return d.places || [];
-    } catch (e) {
-      return [];
-    }
+  const res = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': GOOGLE_API_KEY || '',
+      'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.priceLevel,places.primaryTypeDisplayName,places.types,places.regularOpeningHours,places.parkingOptions'
+    },
+    body: JSON.stringify(payload)
   });
 
-  const allBatches = await Promise.all(fetchPromises);
-  const seenIds = new Set();
-  const combined = [];
-
-  for (const batch of allBatches) {
-    for (const p of batch) {
-      if (p && p.id && !seenIds.has(p.id)) {
-        seenIds.add(p.id);
-        combined.push(p);
-      }
-    }
+  const d = await res.json();
+  if (d.error) {
+    console.error('Google Places API Fehler:', JSON.stringify(d.error));
   }
+  const places = d.places || [];
 
-  return combined.map((p) => {
+  return places.map((p) => {
     const pLat = p.location?.latitude || lat;
     const pLon = p.location?.longitude || lon;
 
@@ -312,7 +319,7 @@ app.post('/api/restaurants', async (req, res) => {
     const restaurants = await fetchRestaurantsFromGoogle(lat, lon, radiusKm);
     res.json({ restaurants });
   } catch (error) {
-    res.status(500).json({ error: 'Serverfehler' });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -514,4 +521,4 @@ app.post('/api/lobby/submit', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`FoodMatch läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`FoodMatch Diagnose-Server läuft auf Port ${PORT}`));
