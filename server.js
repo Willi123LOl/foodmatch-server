@@ -9,7 +9,10 @@ app.use(cors());
 app.use(express.json());
 
 const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+
+// In-Memory Speicher
 const lobbies = new Map();
+const users = new Map(); // userName -> { name, friends: [], activeInvite: null, lastSeen: Date }
 
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371;
@@ -35,17 +38,100 @@ function analyzeRestaurantFeatures(name, types, address) {
   };
 }
 
-// Autocomplete
+// ================= USER & FREUNDES-SYSTEM =================
+
+// Nutzer registrieren / Ping
+app.post('/api/user/sync', (req, res) => {
+  const { userName } = req.body;
+  if (!userName) return res.status(400).json({ error: 'Name fehlt' });
+
+  const cleanName = userName.trim();
+  if (!users.has(cleanName)) {
+    users.set(cleanName, { name: cleanName, friends: [], activeInvite: null, lastSeen: Date.now() });
+  } else {
+    const u = users.get(cleanName);
+    u.lastSeen = Date.now();
+  }
+
+  const user = users.get(cleanName);
+  res.json({
+    user: {
+      name: user.name,
+      friends: user.friends,
+      activeInvite: user.activeInvite
+    }
+  });
+});
+
+// Freund hinzufügen
+app.post('/api/user/add-friend', (req, res) => {
+  const { userName, friendName } = req.body;
+  const uName = (userName || '').trim();
+  const fName = (friendName || '').trim();
+
+  if (!uName || !fName) return res.status(400).json({ error: 'Name fehlt' });
+  if (uName.toLowerCase() === fName.toLowerCase()) return res.status(400).json({ error: 'Du kannst dich nicht selbst hinzufügen.' });
+
+  if (!users.has(fName)) {
+    return res.status(404).json({ error: `Nutzer "${fName}" wurde nicht gefunden. Stelle sicher, dass er die App einmal geöffnet hat.` });
+  }
+
+  const user = users.get(uName);
+  if (!user.friends.includes(fName)) {
+    user.friends.push(fName);
+  }
+
+  res.json({ success: true, friends: user.friends });
+});
+
+// Freund zu Lobby einladen
+app.post('/api/lobby/invite', (req, res) => {
+  const { hostName, friendName, lobbyCode } = req.body;
+  const f = users.get((friendName || '').trim());
+
+  if (!f) return res.status(404).json({ error: 'Freund existiert nicht.' });
+
+  f.activeInvite = {
+    hostName: hostName.trim(),
+    lobbyCode: lobbyCode.trim(),
+    timestamp: Date.now()
+  };
+
+  res.json({ success: true });
+});
+
+// Einladung annehmen / ablehnen
+app.post('/api/lobby/respond-invite', (req, res) => {
+  const { userName, accept } = req.body;
+  const u = users.get((userName || '').trim());
+  if (!u) return res.status(404).json({ error: 'Nutzer nicht gefunden' });
+
+  const invite = u.activeInvite;
+  u.activeInvite = null; // Zurücksetzen
+
+  if (accept && invite) {
+    const lobby = lobbies.get(invite.lobbyCode);
+    if (lobby && lobby.status === 'waiting') {
+      const exists = lobby.participants.find(p => p.name === u.name);
+      if (!exists) {
+        lobby.participants.push({ name: u.name, ready: false, answers: [] });
+      }
+      return res.json({ success: true, accepted: true, lobbyCode: invite.lobbyCode, lobby });
+    }
+    return res.status(400).json({ error: 'Lobby ist nicht mehr verfügbar.' });
+  }
+
+  res.json({ success: true, accepted: false });
+});
+
+// ================= GOOGLE PLACES API (NEW) =================
+
 app.post('/api/autocomplete', async (req, res) => {
   try {
     const { input, lat, lon } = req.body;
     if (!input || input.trim().length < 2) return res.json({ predictions: [] });
 
-    const payload = {
-      input: input.trim(),
-      languageCode: 'de',
-      includedRegionCodes: ['de']
-    };
+    const payload = { input: input.trim(), languageCode: 'de', includedRegionCodes: ['de'] };
     if (lat && lon) {
       payload.locationBias = { circle: { center: { latitude: lat, longitude: lon }, radius: 30000.0 } };
     }
@@ -73,7 +159,6 @@ app.post('/api/autocomplete', async (req, res) => {
   }
 });
 
-// Geocode Place
 app.post('/api/geocode-place', async (req, res) => {
   try {
     const { placeId } = req.body;
@@ -98,7 +183,6 @@ app.post('/api/geocode-place', async (req, res) => {
   }
 });
 
-// Reverse Geocode
 app.post('/api/reverse-geocode', async (req, res) => {
   try {
     const { lat, lon } = req.body;
@@ -113,11 +197,8 @@ app.post('/api/reverse-geocode', async (req, res) => {
   }
 });
 
-// Multi-Batch-Suche: Lädt bis zu 60+ Restaurants über mehrere Typen
 async function fetchRestaurantsFromGoogle(lat, lon, radiusKm = 20) {
   const radiusMeters = Math.min(Math.round(radiusKm * 1000), 25000);
-
-  // Wir fragen 3 Typen-Gruppen parallel ab, um mehr Vielfalt & bis zu 60 Treffer zu bekommen
   const typeGroups = [
     ['restaurant'],
     ['japanese_restaurant', 'sushi_restaurant', 'asian_restaurant'],
@@ -129,9 +210,7 @@ async function fetchRestaurantsFromGoogle(lat, lon, radiusKm = 20) {
       const payload = {
         includedTypes: types,
         maxResultCount: 20,
-        locationRestriction: {
-          circle: { center: { latitude: lat, longitude: lon }, radius: radiusMeters }
-        }
+        locationRestriction: { circle: { center: { latitude: lat, longitude: lon }, radius: radiusMeters } }
       };
       const res = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
         method: 'POST',
@@ -213,7 +292,6 @@ app.post('/api/restaurants', async (req, res) => {
   }
 });
 
-// Dynamischer Fragen-Generator basierend auf tatsächlichem Inhalt
 function generateDynamicQuestions(pool) {
   const questions = [];
   const total = pool.length;
@@ -224,7 +302,6 @@ function generateDynamicQuestions(pool) {
   const countHeavyMeat = pool.filter(r => r.features?.isHeavyMeat).length;
   const countSitDown = pool.filter(r => r.features?.isCozySitDown).length;
 
-  // Wenn Asiaten/Sushi vorhanden sind, Frage anbieten
   if (countAsian > 0) {
     questions.push({
       id: 'asian',
@@ -286,14 +363,14 @@ app.post('/api/akinator/questions', (req, res) => {
   res.json({ questions });
 });
 
-// Lobby-Verwaltung
+// ================= LOBBY LOGIK =================
+
 app.post('/api/lobby/create', async (req, res) => {
   try {
     const { hostName, lat, lon, radiusKm = 5, minOpenMinutes = 0, requiresParking = false, price = '€€' } = req.body;
     const code = Math.floor(1000 + Math.random() * 9000).toString();
 
     const raw = await fetchRestaurantsFromGoogle(lat, lon, 25);
-
     let maxNumericPrice = 3;
     if (price === '€') maxNumericPrice = 1;
     else if (price === '€€') maxNumericPrice = 2;
@@ -375,14 +452,11 @@ app.post('/api/lobby/submit', (req, res) => {
   if (allReady && lobby.restaurants.length > 0) {
     let pool = [...lobby.restaurants];
 
-    // HARTER Filter: Wenn gewünscht, fliegen unpassende komplett raus!
     lobby.participants.forEach(part => {
       part.answers.forEach(ans => {
         if (ans && ans.isHard && ans.feature) {
           const matchingOnly = pool.filter(r => r.features && r.features[ans.feature] === ans.targetVal);
-          if (matchingOnly.length > 0) {
-            pool = matchingOnly;
-          }
+          if (matchingOnly.length > 0) pool = matchingOnly;
         }
       });
     });
@@ -416,4 +490,4 @@ app.post('/api/lobby/submit', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`FoodMatch Multi-Batch läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`FoodMatch läuft mit Freundesliste auf Port ${PORT}`));
