@@ -20,7 +20,30 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// 1. LIVE-ORTSSUCHE (OpenStreetMap Nominatim)
+// TEST-ROUTE: Öffne das im Browser, um sofort zu sehen ob OSM liefert!
+app.get('/api/test-osm', async (req, res) => {
+  try {
+    const lat = 51.5234;
+    const lon = 6.9288;
+    const query = `[out:json][timeout:15];node["amenity"~"restaurant|fast_food"](around:5000,${lat},${lon});out 20;`;
+
+    const response = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'FoodMatchApp/9.0'
+      },
+      body: `data=${encodeURIComponent(query)}`
+    });
+
+    const data = await response.json();
+    res.json({ success: true, count: data.elements?.length || 0, sample: data.elements?.slice(0, 3) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 1. LIVE-ORTSSUCHE (Nominatim)
 app.post('/api/autocomplete', async (req, res) => {
   try {
     const { input } = req.body;
@@ -30,7 +53,7 @@ app.post('/api/autocomplete', async (req, res) => {
     const url = `https://nominatim.openstreetmap.org/search?q=${q}&format=json&addressdetails=1&countrycodes=de&limit=8`;
 
     const response = await fetch(url, {
-      headers: { 'User-Agent': 'FoodMatchApp/8.0 (contact@foodmatch.app)' }
+      headers: { 'User-Agent': 'FoodMatchApp/9.0 (contact@foodmatch.app)' }
     });
     const data = await response.json();
 
@@ -50,23 +73,22 @@ app.post('/api/autocomplete', async (req, res) => {
   }
 });
 
-// 2. ECHTE RESTAURANT-SUCHE (Overpass mit redundanten Servern)
+// 2. ECHTE RESTAURANTS (POST x-www-form-urlencoded - Der Standard-Weg)
 const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://lz4.overpass-api.de/api/interpreter'
+  'https://overpass.kumi.systems/api/interpreter'
 ];
 
 app.post('/api/restaurants', async (req, res) => {
   try {
-    const { lat, lon, radiusKm = 25 } = req.body;
+    const { lat, lon, radiusKm = 10 } = req.body;
     if (!lat || !lon) return res.status(400).json({ error: 'Koordinaten fehlen.' });
 
-    const reqRadius = parseFloat(radiusKm) || 25;
-    const radiusMeters = Math.min(Math.round(reqRadius * 1000), 30000);
+    const reqRadius = parseFloat(radiusKm) || 10;
+    const radiusMeters = Math.min(Math.round(reqRadius * 1000), 25000);
 
     const query = `
-      [out:json][timeout:12];
+      [out:json][timeout:15];
       (
         node["amenity"~"restaurant|fast_food|cafe"](around:${radiusMeters},${lat},${lon});
         way["amenity"~"restaurant|fast_food|cafe"](around:${radiusMeters},${lat},${lon});
@@ -76,12 +98,16 @@ app.post('/api/restaurants', async (req, res) => {
 
     let elements = [];
 
-    // Nacheinander verfügbare Overpass-Server abfragen
     for (const endpoint of OVERPASS_ENDPOINTS) {
       try {
-        const response = await fetch(`${endpoint}?data=${encodeURIComponent(query)}`, {
-          headers: { 'User-Agent': 'FoodMatchApp/8.0' },
-          signal: AbortSignal.timeout(7000)
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'FoodMatchApp/9.0'
+          },
+          body: `data=${encodeURIComponent(query)}`,
+          signal: AbortSignal.timeout(10000)
         });
 
         if (response.ok) {
@@ -92,7 +118,7 @@ app.post('/api/restaurants', async (req, res) => {
           }
         }
       } catch (e) {
-        // Bei Timeout/Fehler sofort nächsten Server probieren
+        // Bei Fehler nächsten Endpoint nehmen
       }
     }
 
