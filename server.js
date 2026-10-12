@@ -20,7 +20,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// 1. LIVE-ORTSSUCHE (Nominatim)
+// 1. LIVE-ORTSSUCHE (OpenStreetMap Nominatim)
 app.post('/api/autocomplete', async (req, res) => {
   try {
     const { input } = req.body;
@@ -28,7 +28,7 @@ app.post('/api/autocomplete', async (req, res) => {
 
     const q = encodeURIComponent(input.trim());
     const url = `https://nominatim.openstreetmap.org/search?q=${q}&format=json&addressdetails=1&countrycodes=de&limit=8`;
-    
+
     const response = await fetch(url, {
       headers: { 'User-Agent': 'FoodMatchApp/8.0 (contact@foodmatch.app)' }
     });
@@ -50,24 +50,23 @@ app.post('/api/autocomplete', async (req, res) => {
   }
 });
 
-// 2. ECHTE RESTAURANTS (Multi-Mirror Overpass: Garantiert nie blockiert)
+// 2. ECHTE RESTAURANT-SUCHE (Overpass mit redundanten Servern)
 const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
-  'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+  'https://lz4.overpass-api.de/api/interpreter'
 ];
 
 app.post('/api/restaurants', async (req, res) => {
   try {
-    const { lat, lon, radiusKm = 15 } = req.body;
+    const { lat, lon, radiusKm = 25 } = req.body;
     if (!lat || !lon) return res.status(400).json({ error: 'Koordinaten fehlen.' });
 
-    const reqRadius = parseFloat(radiusKm) || 15;
-    const radiusMeters = Math.min(Math.round(reqRadius * 1000), 25000);
+    const reqRadius = parseFloat(radiusKm) || 25;
+    const radiusMeters = Math.min(Math.round(reqRadius * 1000), 30000);
 
-    // Schnelle Overpass QL Query
     const query = `
-      [out:json][timeout:10];
+      [out:json][timeout:12];
       (
         node["amenity"~"restaurant|fast_food|cafe"](around:${radiusMeters},${lat},${lon});
         way["amenity"~"restaurant|fast_food|cafe"](around:${radiusMeters},${lat},${lon});
@@ -77,23 +76,23 @@ app.post('/api/restaurants', async (req, res) => {
 
     let elements = [];
 
-    // Versuche die Server nacheinander (Mirror Fallback)
+    // Nacheinander verfügbare Overpass-Server abfragen
     for (const endpoint of OVERPASS_ENDPOINTS) {
       try {
         const response = await fetch(`${endpoint}?data=${encodeURIComponent(query)}`, {
           headers: { 'User-Agent': 'FoodMatchApp/8.0' },
-          signal: AbortSignal.timeout(6000)
+          signal: AbortSignal.timeout(7000)
         });
 
         if (response.ok) {
           const data = await response.json();
           if (data && data.elements && data.elements.length > 0) {
             elements = data.elements;
-            break; // Erfolgreich echte Daten geladen!
+            break;
           }
         }
-      } catch (err) {
-        // Dieser Mirror hat ein Rate-Limit -> Nächster Server springt sofort ein!
+      } catch (e) {
+        // Bei Timeout/Fehler sofort nächsten Server probieren
       }
     }
 
@@ -151,7 +150,7 @@ app.post('/api/restaurants', async (req, res) => {
   }
 });
 
-// User & Freunde
+// 3. USER- & FREUNDESLISTE
 app.post('/api/user/sync', (req, res) => {
   const { userName = 'Player' } = req.body;
   if (!users.has(userName)) users.set(userName, { name: userName, friends: [], activeInvite: null });
@@ -175,15 +174,20 @@ app.post('/api/user/add-friend', (req, res) => {
   res.json({ success: true, friends: u ? u.friends : [] });
 });
 
-// Lobbys
+// 4. LOBBYS & AKINATOR
 app.post('/api/lobby/create', async (req, res) => {
   const { hostName, lat, lon, radiusKm = 5 } = req.body;
   const code = Math.floor(1000 + Math.random() * 9000).toString();
 
   const lobby = {
-    code, hostName, lat, lon, radiusKm,
+    code,
+    hostName,
+    lat,
+    lon,
+    radiusKm,
     participants: [{ name: hostName, ready: false, answers: [] }],
-    status: 'waiting', winner: null,
+    status: 'waiting',
+    winner: null,
     questions: [
       { id: 'asian', title: "Lust auf Asiatisch oder Sushi?", subtitle: "Sushi, Wok, Ramen", options: [{ text: "🥢 Ja, definitiv Asiatisch / Sushi", feature: 'isAsian', targetVal: true, isHard: true }, { text: "🥖 Nein, lieber europäisch", feature: 'isAsian', targetVal: false }, { text: "🤷 Egal", feature: null }] },
       { id: 'fingerfood', title: "Auf die Hand oder Besteck?", subtitle: "Ess-Erlebnis", options: [{ text: "🍔 Auf die Faust (Burger, Pizza, Döner)", feature: 'isFingerfood', targetVal: true }, { text: "🍽️ Mit Besteck", feature: 'isFingerfood', targetVal: false }, { text: "🤷 Egal", feature: null }] }
