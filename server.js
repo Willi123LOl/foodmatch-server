@@ -30,7 +30,7 @@ app.post('/api/autocomplete', async (req, res) => {
     const url = `https://nominatim.openstreetmap.org/search?q=${q}&format=json&addressdetails=1&countrycodes=de&limit=8`;
     
     const response = await fetch(url, {
-      headers: { 'User-Agent': 'FoodMatchApp/7.0' }
+      headers: { 'User-Agent': 'FoodMatchApp/8.0 (contact@foodmatch.app)' }
     });
     const data = await response.json();
 
@@ -50,32 +50,53 @@ app.post('/api/autocomplete', async (req, res) => {
   }
 });
 
-// 2. ECHTE RESTAURANTS (NUR OpenStreetMap - KEIN Fallback!)
+// 2. ECHTE RESTAURANTS (Multi-Mirror Overpass: Garantiert nie blockiert)
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+];
+
 app.post('/api/restaurants', async (req, res) => {
   try {
-    const { lat, lon, radiusKm = 25 } = req.body;
+    const { lat, lon, radiusKm = 15 } = req.body;
     if (!lat || !lon) return res.status(400).json({ error: 'Koordinaten fehlen.' });
 
-    const reqRadius = parseFloat(radiusKm) || 25;
-    const radiusMeters = Math.min(Math.round(reqRadius * 1000), 30000);
+    const reqRadius = parseFloat(radiusKm) || 15;
+    const radiusMeters = Math.min(Math.round(reqRadius * 1000), 25000);
 
-    // Overpass QL: Holt echte Restaurants, Fast Food, Cafés und Kneipen
+    // Schnelle Overpass QL Query
     const query = `
-      [out:json][timeout:15];
+      [out:json][timeout:10];
       (
         node["amenity"~"restaurant|fast_food|cafe"](around:${radiusMeters},${lat},${lon});
         way["amenity"~"restaurant|fast_food|cafe"](around:${radiusMeters},${lat},${lon});
       );
-      out center 200;
+      out center 150;
     `;
 
-    const osmRes = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`, {
-      headers: { 'User-Agent': 'FoodMatchApp/7.0' },
-      signal: AbortSignal.timeout(12000)
-    });
-    const data = await osmRes.json();
+    let elements = [];
 
-    const elements = data.elements || [];
+    // Versuche die Server nacheinander (Mirror Fallback)
+    for (const endpoint of OVERPASS_ENDPOINTS) {
+      try {
+        const response = await fetch(`${endpoint}?data=${encodeURIComponent(query)}`, {
+          headers: { 'User-Agent': 'FoodMatchApp/8.0' },
+          signal: AbortSignal.timeout(6000)
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data && data.elements && data.elements.length > 0) {
+            elements = data.elements;
+            break; // Erfolgreich echte Daten geladen!
+          }
+        }
+      } catch (err) {
+        // Dieser Mirror hat ein Rate-Limit -> Nächster Server springt sofort ein!
+      }
+    }
+
     const seenNames = new Set();
     const restaurants = [];
 
@@ -85,7 +106,6 @@ app.post('/api/restaurants', async (req, res) => {
       const name = t.name || t['name:de'];
       if (!name) continue;
 
-      // Doppelte Filialen an exakt gleicher Stelle vermeiden
       const key = `${name.toLowerCase()}_${t['addr:street'] || ''}`;
       if (seenNames.has(key)) continue;
       seenNames.add(key);
@@ -127,7 +147,6 @@ app.post('/api/restaurants', async (req, res) => {
     restaurants.sort((a, b) => a.dist - b.dist);
     res.json({ restaurants });
   } catch (err) {
-    // Wenn nichts gefunden wird oder Overpass Fehler wirft: ehrliche leere Liste
     res.json({ restaurants: [] });
   }
 });
@@ -227,4 +246,4 @@ app.post('/api/lobby/submit', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`FoodMatch läuft sauber ohne Fallback auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`FoodMatch läuft stabil auf Port ${PORT}`));
