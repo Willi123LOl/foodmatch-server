@@ -1,13 +1,40 @@
 import express from 'express';
 import cors from 'cors';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import fs from 'fs';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const lobbies = new Map();
-const users = new Map();
+const JWT_SECRET = process.env.JWT_SECRET || 'foodmatch_secret_key_2026';
+const USERS_FILE = './users.json';
 
+// Persistente Benutzer-Datenbank via JSON-Datei
+function loadUsers() {
+  try {
+    if (fs.existsSync(USERS_FILE)) {
+      return JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
+    }
+  } catch (e) {
+    console.error("Fehler beim Laden von users.json:", e);
+  }
+  return {};
+}
+
+function saveUsers(data) {
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error("Fehler beim Speichern von users.json:", e);
+  }
+}
+
+let dbUsers = loadUsers();
+const lobbies = new Map();
+
+// Hilfsfunktion: Distanzberechnung
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -20,188 +47,129 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// TEST-ROUTE: Öffne das im Browser, um sofort zu sehen ob OSM liefert!
-app.get('/api/test-osm', async (req, res) => {
+// ================= AUTHENTIFIZIERUNG =================
+
+// Registrieren
+app.post('/api/auth/register', async (req, res) => {
   try {
-    const lat = 51.5234;
-    const lon = 6.9288;
-    const query = `[out:json][timeout:15];node["amenity"~"restaurant|fast_food"](around:5000,${lat},${lon});out 20;`;
-
-    const response = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'FoodMatchApp/9.0'
-      },
-      body: `data=${encodeURIComponent(query)}`
-    });
-
-    const data = await response.json();
-    res.json({ success: true, count: data.elements?.length || 0, sample: data.elements?.slice(0, 3) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 1. LIVE-ORTSSUCHE (Nominatim)
-app.post('/api/autocomplete', async (req, res) => {
-  try {
-    const { input } = req.body;
-    if (!input || input.trim().length < 2) return res.json({ predictions: [] });
-
-    const q = encodeURIComponent(input.trim());
-    const url = `https://nominatim.openstreetmap.org/search?q=${q}&format=json&addressdetails=1&countrycodes=de&limit=8`;
-
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'FoodMatchApp/9.0 (contact@foodmatch.app)' }
-    });
-    const data = await response.json();
-
-    const predictions = (data || []).map(item => {
-      const city = item.address?.city || item.address?.town || item.address?.village || item.address?.municipality || item.display_name.split(',')[0];
-      return {
-        mainText: city,
-        secondaryText: item.display_name,
-        lat: parseFloat(item.lat),
-        lon: parseFloat(item.lon)
-      };
-    });
-
-    res.json({ predictions });
-  } catch (err) {
-    res.json({ predictions: [] });
-  }
-});
-
-// 2. ECHTE RESTAURANTS (POST x-www-form-urlencoded - Der Standard-Weg)
-const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter'
-];
-
-app.post('/api/restaurants', async (req, res) => {
-  try {
-    const { lat, lon, radiusKm = 10 } = req.body;
-    if (!lat || !lon) return res.status(400).json({ error: 'Koordinaten fehlen.' });
-
-    const reqRadius = parseFloat(radiusKm) || 10;
-    const radiusMeters = Math.min(Math.round(reqRadius * 1000), 25000);
-
-    const query = `
-      [out:json][timeout:15];
-      (
-        node["amenity"~"restaurant|fast_food|cafe"](around:${radiusMeters},${lat},${lon});
-        way["amenity"~"restaurant|fast_food|cafe"](around:${radiusMeters},${lat},${lon});
-      );
-      out center 150;
-    `;
-
-    let elements = [];
-
-    for (const endpoint of OVERPASS_ENDPOINTS) {
-      try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'FoodMatchApp/9.0'
-          },
-          body: `data=${encodeURIComponent(query)}`,
-          signal: AbortSignal.timeout(10000)
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          if (data && data.elements && data.elements.length > 0) {
-            elements = data.elements;
-            break;
-          }
-        }
-      } catch (e) {
-        // Bei Fehler nächsten Endpoint nehmen
-      }
+    const { username, password } = req.body;
+    if (!username || !password || password.length < 4) {
+      return res.status(400).json({ error: 'Benutzername und Passwort (min. 4 Zeichen) erforderlich.' });
     }
 
-    const seenNames = new Set();
-    const restaurants = [];
+    const cleanName = username.trim();
+    const key = cleanName.toLowerCase();
 
-    for (const e of elements) {
-      const t = e.tags;
-      if (!t) continue;
-      const name = t.name || t['name:de'];
-      if (!name) continue;
-
-      const key = `${name.toLowerCase()}_${t['addr:street'] || ''}`;
-      if (seenNames.has(key)) continue;
-      seenNames.add(key);
-
-      const eLat = e.lat || e.center?.lat || lat;
-      const eLon = e.lon || e.center?.lon || lon;
-      const rawCuisine = t.cuisine ? (t.cuisine.charAt(0).toUpperCase() + t.cuisine.slice(1)).replace(/;/g, ', ') : (t.amenity === 'fast_food' ? 'Fast Food' : 'Restaurant');
-      const isFastFood = t.amenity === 'fast_food' || (t.cuisine || '').includes('kebab') || (t.cuisine || '').includes('pizza');
-
-      const street = t['addr:street'] ? `${t['addr:street']} ${t['addr:housenumber'] || ''}` : '';
-      const city = t['addr:city'] || '';
-      const address = street ? `${street}${city ? ', ' + city : ''}` : (city || 'Adresse auf Karte');
-
-      restaurants.push({
-        id: `osm_${e.id}`,
-        name: name,
-        cuisine: rawCuisine,
-        price: isFastFood ? '€' : '€€',
-        numericPrice: isFastFood ? 1 : 2,
-        rating: (4.2 + (name.length % 7) / 10).toFixed(1),
-        address: address,
-        dist: calculateDistance(lat, lon, eLat, eLon),
-        lat: eLat,
-        lon: eLon,
-        isOpenNow: true,
-        openMinutesRemaining: 180,
-        hasParking: Boolean(t.parking || !isFastFood),
-        features: {
-          isFingerfood: isFastFood || (t.cuisine || '').includes('burger') || (t.cuisine || '').includes('döner'),
-          isAsian: (t.cuisine || '').includes('asian') || (t.cuisine || '').includes('sushi') || name.toLowerCase().includes('sushi'),
-          isItalian: (t.cuisine || '').includes('italian') || (t.cuisine || '').includes('pizza'),
-          isHeavyMeat: (t.cuisine || '').includes('kebab') || (t.cuisine || '').includes('burger') || (t.cuisine || '').includes('steak'),
-          isLightHealthy: (t.cuisine || '').includes('salad') || (t.cuisine || '').includes('asian') || t.amenity === 'cafe',
-          isCozySitDown: t.amenity !== 'fast_food'
-        }
-      });
+    if (dbUsers[key]) {
+      return res.status(400).json({ error: 'Dieser Benutzername ist bereits vergeben.' });
     }
 
-    restaurants.sort((a, b) => a.dist - b.dist);
-    res.json({ restaurants });
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = {
+      username: cleanName,
+      password: hashedPassword,
+      friends: [],
+      createdAt: new Date().toISOString()
+    };
+
+    dbUsers[key] = newUser;
+    saveUsers(dbUsers);
+
+    const token = jwt.sign({ username: cleanName }, JWT_SECRET, { expiresIn: '90d' });
+    res.json({ success: true, token, user: { username: cleanName, friends: [] } });
   } catch (err) {
-    res.json({ restaurants: [] });
+    res.status(500).json({ error: 'Fehler bei der Registrierung.' });
   }
 });
 
-// 3. USER- & FREUNDESLISTE
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const key = (username || '').trim().toLowerCase();
+
+    const user = dbUsers[key];
+    if (!user) {
+      return res.status(401).json({ error: 'Benutzername oder Passwort falsch.' });
+    }
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      return res.status(401).json({ error: 'Benutzername oder Passwort falsch.' });
+    }
+
+    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '90d' });
+    res.json({ success: true, token, user: { username: user.username, friends: user.friends || [] } });
+  } catch (err) {
+    res.status(500).json({ error: 'Fehler beim Login.' });
+  }
+});
+
+// Auto-Login / Sitzungsprüfung beim App-Start
+app.get('/api/auth/me', (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Kein Token vorhanden.' });
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const key = decoded.username.toLowerCase();
+    const user = dbUsers[key];
+    if (!user) return res.status(404).json({ error: 'Benutzer nicht gefunden.' });
+
+    res.json({ user: { username: user.username, friends: user.friends || [] } });
+  } catch (e) {
+    res.status(401).json({ error: 'Sitzung abgelaufen.' });
+  }
+});
+
+// ================= USER & FREUNDE =================
+
 app.post('/api/user/sync', (req, res) => {
-  const { userName = 'Player' } = req.body;
-  if (!users.has(userName)) users.set(userName, { name: userName, friends: [], activeInvite: null });
-  res.json({ user: users.get(userName) });
+  const { userName = 'Gast' } = req.body;
+  const key = userName.trim().toLowerCase();
+
+  // Falls der Nutzer im Auth-Speicher existiert
+  if (dbUsers[key]) {
+    return res.json({ user: dbUsers[key] });
+  }
+
+  // Fallback für unregistrierte Gäste
+  res.json({ user: { username: userName, friends: [], activeInvite: null } });
 });
 
 app.get('/api/user/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase();
+  const me = (req.query.me || '').toLowerCase();
   const matched = [];
-  for (const [name] of users.entries()) {
-    if (name.toLowerCase().includes(q)) matched.push(name);
+
+  for (const [key, user] of Object.entries(dbUsers)) {
+    if (key !== me && user.username.toLowerCase().includes(q)) {
+      matched.push(user.username);
+    }
   }
   res.json({ users: matched });
 });
 
 app.post('/api/user/add-friend', (req, res) => {
   const { userName, friendName } = req.body;
-  if (!users.has(friendName)) users.set(friendName, { name: friendName, friends: [], activeInvite: null });
-  const u = users.get(userName);
-  if (u && !u.friends.includes(friendName)) u.friends.push(friendName);
-  res.json({ success: true, friends: u ? u.friends : [] });
+  const userKey = (userName || '').trim().toLowerCase();
+  const friendKey = (friendName || '').trim().toLowerCase();
+
+  if (dbUsers[userKey] && dbUsers[friendKey]) {
+    if (!dbUsers[userKey].friends.includes(dbUsers[friendKey].username)) {
+      dbUsers[userKey].friends.push(dbUsers[friendKey].username);
+      saveUsers(dbUsers);
+    }
+    return res.json({ success: true, friends: dbUsers[userKey].friends });
+  }
+
+  res.json({ success: false, friends: [] });
 });
 
-// 4. LOBBYS & AKINATOR
-app.post('/api/lobby/create', async (req, res) => {
+// ================= LOBBY & MEHRSPIELER =================
+
+app.post('/api/lobby/create', (req, res) => {
   const { hostName, lat, lon, radiusKm = 5 } = req.body;
   const code = Math.floor(1000 + Math.random() * 9000).toString();
 
@@ -213,11 +181,7 @@ app.post('/api/lobby/create', async (req, res) => {
     radiusKm,
     participants: [{ name: hostName, ready: false, answers: [] }],
     status: 'waiting',
-    winner: null,
-    questions: [
-      { id: 'asian', title: "Lust auf Asiatisch oder Sushi?", subtitle: "Sushi, Wok, Ramen", options: [{ text: "🥢 Ja, definitiv Asiatisch / Sushi", feature: 'isAsian', targetVal: true, isHard: true }, { text: "🥖 Nein, lieber europäisch", feature: 'isAsian', targetVal: false }, { text: "🤷 Egal", feature: null }] },
-      { id: 'fingerfood', title: "Auf die Hand oder Besteck?", subtitle: "Ess-Erlebnis", options: [{ text: "🍔 Auf die Faust (Burger, Pizza, Döner)", feature: 'isFingerfood', targetVal: true }, { text: "🍽️ Mit Besteck", feature: 'isFingerfood', targetVal: false }, { text: "🤷 Egal", feature: null }] }
-    ]
+    winner: null
   };
   lobbies.set(code, lobby);
   res.json({ success: true, code, lobby });
@@ -235,7 +199,7 @@ app.post('/api/lobby/join', (req, res) => {
 
 app.get('/api/lobby/status/:code', (req, res) => {
   const lobby = lobbies.get(req.params.code);
-  if (!lobby) return res.status(404).json({ error: 'Nicht gefunden' });
+  if (!lobby) return res.status(404).json({ error: 'Lobby nicht gefunden.' });
   res.json({ lobby });
 });
 
@@ -246,19 +210,30 @@ app.post('/api/lobby/start', (req, res) => {
 });
 
 app.post('/api/lobby/invite', (req, res) => {
-  const f = users.get(req.body.friendName);
-  if (f) f.activeInvite = { hostName: req.body.hostName, lobbyCode: req.body.lobbyCode, timestamp: Date.now() };
+  const friendKey = (req.body.friendName || '').trim().toLowerCase();
+  if (dbUsers[friendKey]) {
+    dbUsers[friendKey].activeInvite = {
+      hostName: req.body.hostName,
+      lobbyCode: req.body.lobbyCode,
+      timestamp: Date.now()
+    };
+  }
   res.json({ success: true });
 });
 
 app.post('/api/lobby/respond-invite', (req, res) => {
-  const u = users.get(req.body.userName);
+  const userKey = (req.body.userName || '').trim().toLowerCase();
+  const u = dbUsers[userKey];
   if (!u || !u.activeInvite) return res.json({ accepted: false });
+
   const inv = u.activeInvite;
   u.activeInvite = null;
   const lobby = lobbies.get(inv.lobbyCode);
+
   if (req.body.accept && lobby) {
-    if (!lobby.participants.find(p => p.name === u.name)) lobby.participants.push({ name: u.name, ready: false, answers: [] });
+    if (!lobby.participants.find(p => p.name === u.username)) {
+      lobby.participants.push({ name: u.username, ready: false, answers: [] });
+    }
     return res.json({ accepted: true, lobbyCode: inv.lobbyCode, lobby });
   }
   res.json({ accepted: false });
@@ -266,9 +241,12 @@ app.post('/api/lobby/respond-invite', (req, res) => {
 
 app.post('/api/lobby/submit', (req, res) => {
   const lobby = lobbies.get(req.body.code);
-  if (!lobby) return res.status(404).json({ error: 'Fehlt' });
+  if (!lobby) return res.status(404).json({ error: 'Lobby fehlt.' });
   const p = lobby.participants.find(x => x.name === req.body.userName);
-  if (p) { p.answers = req.body.answers; p.ready = true; }
+  if (p) {
+    p.answers = req.body.answers;
+    p.ready = true;
+  }
   if (lobby.participants.every(x => x.ready)) {
     lobby.status = 'finished';
   }
