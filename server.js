@@ -32,7 +32,6 @@ function saveUsers(data) {
 
 let dbUsers = loadUsers();
 
-// Standard-Node.js crypto: Keine zusätzlichen npm-Pakete nötig!
 function hashPassword(password) {
   return crypto.createHash('sha256').update(password + '_foodmatch_salt_2026').digest('hex');
 }
@@ -43,7 +42,7 @@ function generateToken() {
 
 const activeTokens = new Map();
 
-// --- AUTH ROUTEN (REGISTRIEREN, LOGIN, AUTO-LOGIN) ---
+// --- AUTH ROUTEN ---
 
 // 1. Registrieren
 app.post('/api/auth/register', (req, res) => {
@@ -63,6 +62,7 @@ app.post('/api/auth/register', (req, res) => {
     username: cleanName,
     passwordHash: hashPassword(password),
     friends: [],
+    friendRequests: [], // Eingehende Anfragen
     createdAt: new Date().toISOString()
   };
 
@@ -72,7 +72,7 @@ app.post('/api/auth/register', (req, res) => {
   const token = generateToken();
   activeTokens.set(token, cleanName);
 
-  res.json({ success: true, token, user: { username: cleanName, friends: [] } });
+  res.json({ success: true, token, user: { username: cleanName, friends: [], friendRequests: [] } });
 });
 
 // 2. Anmelden
@@ -92,7 +92,15 @@ app.post('/api/auth/login', (req, res) => {
   const token = generateToken();
   activeTokens.set(token, user.username);
 
-  res.json({ success: true, token, user: { username: user.username, friends: user.friends || [] } });
+  res.json({ 
+    success: true, 
+    token, 
+    user: { 
+      username: user.username, 
+      friends: user.friends || [], 
+      friendRequests: user.friendRequests || [] 
+    } 
+  });
 });
 
 // 3. Auto-Login
@@ -113,18 +121,29 @@ app.get('/api/auth/me', (req, res) => {
     return res.status(404).json({ error: 'Nutzer nicht gefunden' });
   }
 
-  res.json({ user: { username: user.username, friends: user.friends || [] } });
+  res.json({ 
+    user: { 
+      username: user.username, 
+      friends: user.friends || [], 
+      friendRequests: user.friendRequests || [] 
+    } 
+  });
 });
 
-// --- USER SYNC & FREUNDE ---
+// --- USER SYNC & FREUNDE-SYSTEM ---
+
 app.post('/api/user/sync', (req, res) => {
   const { userName = 'Gast' } = req.body;
   const key = userName.toLowerCase();
 
   if (!dbUsers[key]) {
-    dbUsers[key] = { username: userName, passwordHash: null, friends: [], activeInvite: null };
+    dbUsers[key] = { username: userName, passwordHash: null, friends: [], friendRequests: [], activeInvite: null };
     saveUsers(dbUsers);
   }
+
+  // Sicherstellen, dass Arrays initialisiert sind
+  if (!dbUsers[key].friends) dbUsers[key].friends = [];
+  if (!dbUsers[key].friendRequests) dbUsers[key].friendRequests = [];
 
   res.json({ user: dbUsers[key] });
 });
@@ -142,20 +161,76 @@ app.get('/api/user/search', (req, res) => {
   res.json({ users: matched.slice(0, 5) });
 });
 
-app.post('/api/user/add-friend', (req, res) => {
+// Freundschaftsanfrage SENDEN
+app.post('/api/user/request-friend', (req, res) => {
   const { userName, friendName } = req.body;
   const myKey = (userName || '').toLowerCase();
+  const friendKey = (friendName || '').toLowerCase();
 
   const me = dbUsers[myKey];
-  if (me && !me.friends.includes(friendName)) {
-    me.friends.push(friendName);
-    saveUsers(dbUsers);
+  const friend = dbUsers[friendKey];
+
+  if (!me || !friend) {
+    return res.status(404).json({ error: 'Spieler nicht gefunden.' });
   }
 
-  res.json({ success: true, friends: me ? me.friends : [] });
+  if (me.friends && me.friends.includes(friend.username)) {
+    return res.status(400).json({ error: `${friend.username} ist bereits dein Freund!` });
+  }
+
+  if (!friend.friendRequests) friend.friendRequests = [];
+
+  // Bereits angefragt?
+  if (friend.friendRequests.includes(me.username)) {
+    return res.status(400).json({ error: 'Anfrage wurde bereits gesendet.' });
+  }
+
+  friend.friendRequests.push(me.username);
+  saveUsers(dbUsers);
+
+  res.json({ success: true, message: `Anfrage an ${friend.username} gesendet!` });
+});
+
+// Freundschaftsanfrage ANNEHMEN oder ABLEHNEN
+app.post('/api/user/respond-friend-request', (req, res) => {
+  const { userName, requesterName, accept } = req.body;
+  const myKey = (userName || '').toLowerCase();
+  const requesterKey = (requesterName || '').toLowerCase();
+
+  const me = dbUsers[myKey];
+  const requester = dbUsers[requesterKey];
+
+  if (!me) return res.status(404).json({ error: 'Benutzer nicht gefunden' });
+
+  // Anfrage entfernen
+  if (me.friendRequests) {
+    me.friendRequests = me.friendRequests.filter(name => name.toLowerCase() !== requesterKey);
+  }
+
+  if (accept && requester) {
+    // Beidseitig als Freund hinzufügen!
+    if (!me.friends) me.friends = [];
+    if (!requester.friends) requester.friends = [];
+
+    if (!me.friends.includes(requester.username)) {
+      me.friends.push(requester.username);
+    }
+    if (!requester.friends.includes(me.username)) {
+      requester.friends.push(me.username);
+    }
+  }
+
+  saveUsers(dbUsers);
+
+  res.json({ 
+    success: true, 
+    friends: me.friends || [], 
+    friendRequests: me.friendRequests || [] 
+  });
 });
 
 // --- LOBBYS & AKINATOR ---
+
 app.post('/api/lobby/create', (req, res) => {
   const { hostName, lat, lon, radiusKm = 5 } = req.body;
   const code = Math.floor(1000 + Math.random() * 9000).toString();
