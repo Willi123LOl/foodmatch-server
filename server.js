@@ -1,17 +1,16 @@
 import express from 'express';
 import cors from 'cors';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 import fs from 'fs';
+import crypto from 'crypto';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'foodmatch_secret_key_2026';
 const USERS_FILE = './users.json';
+const lobbies = new Map();
 
-// Persistente Benutzer-Datenbank via JSON-Datei
+// --- JSON-DATEI FÜR ACCOUNTS LADEN & SPEICHERN ---
 function loadUsers() {
   try {
     if (fs.existsSync(USERS_FILE)) {
@@ -32,110 +31,102 @@ function saveUsers(data) {
 }
 
 let dbUsers = loadUsers();
-const lobbies = new Map();
 
-// Hilfsfunktion: Distanzberechnung
-function calculateDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
+// Standard-Node.js crypto: Keine zusätzlichen npm-Pakete nötig!
+function hashPassword(password) {
+  return crypto.createHash('sha256').update(password + '_foodmatch_salt_2026').digest('hex');
 }
 
-// ================= AUTHENTIFIZIERUNG =================
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
 
-// Registrieren
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password || password.length < 4) {
-      return res.status(400).json({ error: 'Benutzername und Passwort (min. 4 Zeichen) erforderlich.' });
-    }
+const activeTokens = new Map();
 
-    const cleanName = username.trim();
-    const key = cleanName.toLowerCase();
+// --- AUTH ROUTEN (REGISTRIEREN, LOGIN, AUTO-LOGIN) ---
 
-    if (dbUsers[key]) {
-      return res.status(400).json({ error: 'Dieser Benutzername ist bereits vergeben.' });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = {
-      username: cleanName,
-      password: hashedPassword,
-      friends: [],
-      createdAt: new Date().toISOString()
-    };
-
-    dbUsers[key] = newUser;
-    saveUsers(dbUsers);
-
-    const token = jwt.sign({ username: cleanName }, JWT_SECRET, { expiresIn: '90d' });
-    res.json({ success: true, token, user: { username: cleanName, friends: [] } });
-  } catch (err) {
-    res.status(500).json({ error: 'Fehler bei der Registrierung.' });
+// 1. Registrieren
+app.post('/api/auth/register', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password || password.length < 4) {
+    return res.status(400).json({ error: 'Name und Passwort (mind. 4 Zeichen) eingeben.' });
   }
+
+  const cleanName = username.trim();
+  const key = cleanName.toLowerCase();
+
+  if (dbUsers[key]) {
+    return res.status(400).json({ error: 'Dieser Name ist bereits vergeben.' });
+  }
+
+  const newUser = {
+    username: cleanName,
+    passwordHash: hashPassword(password),
+    friends: [],
+    createdAt: new Date().toISOString()
+  };
+
+  dbUsers[key] = newUser;
+  saveUsers(dbUsers);
+
+  const token = generateToken();
+  activeTokens.set(token, cleanName);
+
+  res.json({ success: true, token, user: { username: cleanName, friends: [] } });
 });
 
-// Login
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    const key = (username || '').trim().toLowerCase();
-
-    const user = dbUsers[key];
-    if (!user) {
-      return res.status(401).json({ error: 'Benutzername oder Passwort falsch.' });
-    }
-
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) {
-      return res.status(401).json({ error: 'Benutzername oder Passwort falsch.' });
-    }
-
-    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '90d' });
-    res.json({ success: true, token, user: { username: user.username, friends: user.friends || [] } });
-  } catch (err) {
-    res.status(500).json({ error: 'Fehler beim Login.' });
+// 2. Anmelden
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Name und Passwort eingeben.' });
   }
+
+  const key = username.trim().toLowerCase();
+  const user = dbUsers[key];
+
+  if (!user || user.passwordHash !== hashPassword(password)) {
+    return res.status(401).json({ error: 'Ungültiger Name oder falsches Passwort.' });
+  }
+
+  const token = generateToken();
+  activeTokens.set(token, user.username);
+
+  res.json({ success: true, token, user: { username: user.username, friends: user.friends || [] } });
 });
 
-// Auto-Login / Sitzungsprüfung beim App-Start
+// 3. Auto-Login
 app.get('/api/auth/me', (req, res) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Kein Token vorhanden.' });
+  if (!authHeader) return res.status(401).json({ error: 'Kein Token' });
 
-  const token = authHeader.split(' ')[1];
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const key = decoded.username.toLowerCase();
-    const user = dbUsers[key];
-    if (!user) return res.status(404).json({ error: 'Benutzer nicht gefunden.' });
+  const token = authHeader.replace('Bearer ', '').trim();
+  const username = activeTokens.get(token);
 
-    res.json({ user: { username: user.username, friends: user.friends || [] } });
-  } catch (e) {
-    res.status(401).json({ error: 'Sitzung abgelaufen.' });
+  if (!username) {
+    return res.status(401).json({ error: 'Sitzung abgelaufen' });
   }
+
+  const key = username.toLowerCase();
+  const user = dbUsers[key];
+  if (!user) {
+    return res.status(404).json({ error: 'Nutzer nicht gefunden' });
+  }
+
+  res.json({ user: { username: user.username, friends: user.friends || [] } });
 });
 
-// ================= USER & FREUNDE =================
-
+// --- USER SYNC & FREUNDE ---
 app.post('/api/user/sync', (req, res) => {
   const { userName = 'Gast' } = req.body;
-  const key = userName.trim().toLowerCase();
+  const key = userName.toLowerCase();
 
-  // Falls der Nutzer im Auth-Speicher existiert
-  if (dbUsers[key]) {
-    return res.json({ user: dbUsers[key] });
+  if (!dbUsers[key]) {
+    dbUsers[key] = { username: userName, passwordHash: null, friends: [], activeInvite: null };
+    saveUsers(dbUsers);
   }
 
-  // Fallback für unregistrierte Gäste
-  res.json({ user: { username: userName, friends: [], activeInvite: null } });
+  res.json({ user: dbUsers[key] });
 });
 
 app.get('/api/user/search', (req, res) => {
@@ -144,31 +135,27 @@ app.get('/api/user/search', (req, res) => {
   const matched = [];
 
   for (const [key, user] of Object.entries(dbUsers)) {
-    if (key !== me && user.username.toLowerCase().includes(q)) {
+    if (key !== me && key.includes(q)) {
       matched.push(user.username);
     }
   }
-  res.json({ users: matched });
+  res.json({ users: matched.slice(0, 5) });
 });
 
 app.post('/api/user/add-friend', (req, res) => {
   const { userName, friendName } = req.body;
-  const userKey = (userName || '').trim().toLowerCase();
-  const friendKey = (friendName || '').trim().toLowerCase();
+  const myKey = (userName || '').toLowerCase();
 
-  if (dbUsers[userKey] && dbUsers[friendKey]) {
-    if (!dbUsers[userKey].friends.includes(dbUsers[friendKey].username)) {
-      dbUsers[userKey].friends.push(dbUsers[friendKey].username);
-      saveUsers(dbUsers);
-    }
-    return res.json({ success: true, friends: dbUsers[userKey].friends });
+  const me = dbUsers[myKey];
+  if (me && !me.friends.includes(friendName)) {
+    me.friends.push(friendName);
+    saveUsers(dbUsers);
   }
 
-  res.json({ success: false, friends: [] });
+  res.json({ success: true, friends: me ? me.friends : [] });
 });
 
-// ================= LOBBY & MEHRSPIELER =================
-
+// --- LOBBYS & AKINATOR ---
 app.post('/api/lobby/create', (req, res) => {
   const { hostName, lat, lon, radiusKm = 5 } = req.body;
   const code = Math.floor(1000 + Math.random() * 9000).toString();
@@ -180,9 +167,9 @@ app.post('/api/lobby/create', (req, res) => {
     lon,
     radiusKm,
     participants: [{ name: hostName, ready: false, answers: [] }],
-    status: 'waiting',
-    winner: null
+    status: 'waiting'
   };
+
   lobbies.set(code, lobby);
   res.json({ success: true, code, lobby });
 });
@@ -191,6 +178,7 @@ app.post('/api/lobby/join', (req, res) => {
   const { code, userName } = req.body;
   const lobby = lobbies.get(code);
   if (!lobby) return res.status(404).json({ error: 'Lobby nicht gefunden.' });
+
   if (!lobby.participants.find(p => p.name === userName)) {
     lobby.participants.push({ name: userName, ready: false, answers: [] });
   }
@@ -199,7 +187,7 @@ app.post('/api/lobby/join', (req, res) => {
 
 app.get('/api/lobby/status/:code', (req, res) => {
   const lobby = lobbies.get(req.params.code);
-  if (!lobby) return res.status(404).json({ error: 'Lobby nicht gefunden.' });
+  if (!lobby) return res.status(404).json({ error: 'Nicht gefunden' });
   res.json({ lobby });
 });
 
@@ -210,26 +198,25 @@ app.post('/api/lobby/start', (req, res) => {
 });
 
 app.post('/api/lobby/invite', (req, res) => {
-  const friendKey = (req.body.friendName || '').trim().toLowerCase();
-  if (dbUsers[friendKey]) {
-    dbUsers[friendKey].activeInvite = {
-      hostName: req.body.hostName,
-      lobbyCode: req.body.lobbyCode,
-      timestamp: Date.now()
-    };
+  const friendKey = (req.body.friendName || '').toLowerCase();
+  const f = dbUsers[friendKey];
+  if (f) {
+    f.activeInvite = { hostName: req.body.hostName, lobbyCode: req.body.lobbyCode, timestamp: Date.now() };
+    saveUsers(dbUsers);
   }
   res.json({ success: true });
 });
 
 app.post('/api/lobby/respond-invite', (req, res) => {
-  const userKey = (req.body.userName || '').trim().toLowerCase();
-  const u = dbUsers[userKey];
+  const myKey = (req.body.userName || '').toLowerCase();
+  const u = dbUsers[myKey];
   if (!u || !u.activeInvite) return res.json({ accepted: false });
 
   const inv = u.activeInvite;
   u.activeInvite = null;
-  const lobby = lobbies.get(inv.lobbyCode);
+  saveUsers(dbUsers);
 
+  const lobby = lobbies.get(inv.lobbyCode);
   if (req.body.accept && lobby) {
     if (!lobby.participants.find(p => p.name === u.username)) {
       lobby.participants.push({ name: u.username, ready: false, answers: [] });
@@ -241,12 +228,11 @@ app.post('/api/lobby/respond-invite', (req, res) => {
 
 app.post('/api/lobby/submit', (req, res) => {
   const lobby = lobbies.get(req.body.code);
-  if (!lobby) return res.status(404).json({ error: 'Lobby fehlt.' });
+  if (!lobby) return res.status(404).json({ error: 'Fehlt' });
+
   const p = lobby.participants.find(x => x.name === req.body.userName);
-  if (p) {
-    p.answers = req.body.answers;
-    p.ready = true;
-  }
+  if (p) { p.answers = req.body.answers; p.ready = true; }
+
   if (lobby.participants.every(x => x.ready)) {
     lobby.status = 'finished';
   }
