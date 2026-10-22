@@ -396,7 +396,7 @@ app.get('/api/places', async (req, res) => {
           $geometry: { type: 'Point', coordinates: [lon, lat] },$maxDistance: radiusMeters
         }
       }
-    }).limit(200);
+    }).limit(1000);
 
     // Format identisch für das Frontend aufbereiten
     const elements = docs.map(d => ({
