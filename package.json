@@ -11,8 +11,10 @@
   "description": "",
   "dependencies": {
     "cors": "^2.8.6",
-    "dotenv": "^18.0.5",
-    "express": "^5.2.1"
+    "dotenv": "^18.0.8",
+    "express": "^5.2.1",
+    "mongoose": "^9.11.3",
+    "osm-pbf-parser": "^2.3.0"
   },
   "type": "module"
 }
