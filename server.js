@@ -43,6 +43,13 @@ const restaurantSchema = new mongoose.Schema({
   hasParking: { type: Boolean, default: false },
   openingHours: { type: String, default: '' },
   searchKeywords: { type: String, default: '' },
+  customHours: {
+    hoursText: { type: String, default: '' },
+    proposedBy: { type: String, default: '' },
+    status: { type: String, enum: ['pending', 'verified', 'none'], default: 'none' },
+    confirmations: { type: [String], default: [] },
+    updatedAt: { type: Date, default: Date.now }
+  },
   location: {
     type: {
       type: String,
@@ -399,25 +406,135 @@ app.get('/api/places', async (req, res) => {
     }).limit(1000);
 
     // Format identisch für das Frontend aufbereiten
-    const elements = docs.map(d => ({
-      id: d.osmId || d._id.toString(),
-      lat: d.location.coordinates[1],
-      lon: d.location.coordinates[0],
-      tags: {
-        name: d.name,
-        brand: d.brand || '',
-        amenity: d.amenity || 'restaurant',
-        cuisine: d.cuisine || '',
-        'addr:street': d.address || '',
-        opening_hours: d.openingHours || '',
-        parking: d.hasParking ? 'yes' : undefined
-      }
-    }));
+    // Format identisch für das Frontend aufbereiten
+    const elements = docs.map(d => {
+      // Wenn die Community-Zeiten verifiziert sind (>= 3 Bestätigungen), überschreiben sie den OSM-Wert
+      const isVerified = d.customHours && d.customHours.status === 'verified';
+      const effectiveHours = isVerified ? d.customHours.hoursText : (d.openingHours || '');
+
+      return {
+        id: d.osmId || d._id.toString(),
+        lat: d.location.coordinates[1],
+        lon: d.location.coordinates[0],
+        customHours: d.customHours && d.customHours.status !== 'none' ? d.customHours : null,
+        tags: {
+          name: d.name,
+          brand: d.brand || '',
+          amenity: d.amenity || 'restaurant',
+          cuisine: d.cuisine || '',
+          'addr:street': d.address || '',
+          opening_hours: effectiveHours,
+          parking: d.hasParking ? 'yes' : undefined
+        }
+      };
+    });
 
     res.json({ elements, count: elements.length });
   } catch (error) {
     console.error('[MongoDB Places Fehler]:', error);
     res.status(500).json({ error: 'Fehler beim Laden der Orte aus der Datenbank.' });
+  }
+});
+// ==========================================
+// COMMUNITY CROWDSOURCING: ÖFFNUNGSZEITEN
+// ==========================================
+
+// 1. Öffnungszeit vorschlagen / bearbeiten
+app.post('/api/places/propose-hours', async (req, res) => {
+  try {
+    const { placeId, placeName, hoursText, userName, lat, lon } = req.body;
+    if (!userName || !placeId || !hoursText || hoursText.trim().length < 4) {
+      return res.status(400).json({ error: 'Ungültige Eingaben.' });
+    }
+
+    const cleanHours = hoursText.trim();
+    const newProposal = {
+      hoursText: cleanHours,
+      proposedBy: userName,
+      status: 'pending',
+      confirmations: [], // Benötigt noch 3 fremde Stimmen
+      updatedAt: new Date()
+    };
+
+    // Suche über osmId ODER MongoDB ObjectId
+    const query = mongoose.Types.ObjectId.isValid(placeId)
+      ? { $or: [{ osmId: String(placeId) }, { _id: placeId }] }
+      : { osmId: String(placeId) };
+
+    let restaurant = await Restaurant.findOne(query);
+
+    if (restaurant) {
+      restaurant.customHours = newProposal;
+      await restaurant.save();
+    } else if (lat && lon) {
+      // Falls Restaurant noch nicht in MongoDB existiert
+      restaurant = await Restaurant.create({
+        osmId: String(placeId),
+        name: placeName || 'Restaurant',
+        customHours: newProposal,
+        location: {
+          type: 'Point',
+          coordinates: [parseFloat(lon), parseFloat(lat)]
+        }
+      });
+    } else {
+      return res.status(404).json({ error: 'Lokal nicht gefunden.' });
+    }
+
+    res.json({ success: true, message: 'Vorschlag eingereicht! Benötigt 3 Bestätigungen anderer Nutzer.' });
+  } catch (err) {
+    console.error('[Propose Hours Fehler]:', err);
+    res.status(500).json({ error: 'Fehler beim Speichern des Vorschlags.' });
+  }
+});
+
+// 2. Öffnungszeit bestätigen (Upvote durch fremde Nutzer)
+app.post('/api/places/confirm-hours', async (req, res) => {
+  try {
+    const { placeId, userName } = req.body;
+    if (!userName || !placeId) {
+      return res.status(400).json({ error: 'Fehlende Angaben.' });
+    }
+
+    const query = mongoose.Types.ObjectId.isValid(placeId)
+      ? { $or: [{ osmId: String(placeId) }, { _id: placeId }] }
+      : { osmId: String(placeId) };
+
+    const restaurant = await Restaurant.findOne(query);
+
+    if (!restaurant || !restaurant.customHours || restaurant.customHours.status === 'none') {
+      return res.status(404).json({ error: 'Kein offener Vorschlag für dieses Lokal vorhanden.' });
+    }
+
+    // Regel 1: Eigener Vorschlag darf nicht bestätigt werden
+    if (restaurant.customHours.proposedBy === userName) {
+      return res.status(400).json({ error: 'Du kannst deinen eigenen Vorschlag nicht bestätigen!' });
+    }
+
+    // Regel 2: Jeder Account darf nur 1x abstimmen
+    if (restaurant.customHours.confirmations.includes(userName)) {
+      return res.status(400).json({ error: 'Du hast diesen Vorschlag bereits bestätigt.' });
+    }
+
+    restaurant.customHours.confirmations.push(userName);
+
+    // Regel 3: Ab 3 Bestätigungen wird es offiziell verifiziert
+    if (restaurant.customHours.confirmations.length >= 3) {
+      restaurant.customHours.status = 'verified';
+      restaurant.openingHours = restaurant.customHours.hoursText; // Dauerhaft übernehmen
+    }
+
+    await restaurant.save();
+
+    res.json({
+      success: true,
+      confirmationsCount: restaurant.customHours.confirmations.length,
+      isVerified: restaurant.customHours.status === 'verified',
+      hoursText: restaurant.customHours.hoursText
+    });
+  } catch (err) {
+    console.error('[Confirm Hours Fehler]:', err);
+    res.status(500).json({ error: 'Fehler beim Bestätigen der Öffnungszeit.' });
   }
 });
 
