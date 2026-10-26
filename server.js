@@ -23,6 +23,7 @@ const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   usernameLower: { type: String, required: true, unique: true },
   passwordHash: { type: String, required: true },
+  xp: { type: Number, default: 0 }, // <-- HIER ERGÄNZEN
   friends: { type: [String], default: [] },
   friendRequests: { type: [String], default: [] },
   activeInvite: { type: Object, default: null }
