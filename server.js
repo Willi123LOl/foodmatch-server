@@ -145,6 +145,7 @@ app.post('/api/auth/login', async (req, res) => {
       token,
       user: {
         username: user.username,
+        xp: user.xp || 0,
         friends: user.friends || [],
         friendRequests: user.friendRequests || []
       }
@@ -176,6 +177,7 @@ app.get('/api/auth/me', async (req, res) => {
     res.json({
       user: {
         username: user.username,
+        xp: user.xp || 0,
         friends: user.friends || [],
         friendRequests: user.friendRequests || []
       }
@@ -481,6 +483,8 @@ app.post('/api/places/propose-hours', async (req, res) => {
     } else {
       return res.status(404).json({ error: 'Lokal nicht gefunden.' });
     }
+    // Dem Einreicher 20 XP gutschreiben
+    await User.updateOne({ usernameLower: userName.toLowerCase() }, { $inc: { xp: 20 } });
 
     res.json({ success: true, message: 'Vorschlag eingereicht! Benötigt 3 Bestätigungen anderer Nutzer.' });
   } catch (err) {
@@ -489,6 +493,7 @@ app.post('/api/places/propose-hours', async (req, res) => {
   }
 });
 
+// 2. Öffnungszeit bestätigen (Upvote durch fremde Nutzer)
 // 2. Öffnungszeit bestätigen (Upvote durch fremde Nutzer)
 app.post('/api/places/confirm-hours', async (req, res) => {
   try {
@@ -508,21 +513,32 @@ app.post('/api/places/confirm-hours', async (req, res) => {
     }
 
     // Regel 1: Eigener Vorschlag darf nicht bestätigt werden
-    if (restaurant.customHours.proposedBy === userName) {
+    if (restaurant.customHours.proposedBy.toLowerCase() === userName.toLowerCase()) {
       return res.status(400).json({ error: 'Du kannst deinen eigenen Vorschlag nicht bestätigen!' });
     }
 
     // Regel 2: Jeder Account darf nur 1x abstimmen
-    if (restaurant.customHours.confirmations.includes(userName)) {
+    const alreadyVoted = restaurant.customHours.confirmations.some(
+      u => u.toLowerCase() === userName.toLowerCase()
+    );
+    if (alreadyVoted) {
       return res.status(400).json({ error: 'Du hast diesen Vorschlag bereits bestätigt.' });
     }
 
     restaurant.customHours.confirmations.push(userName);
 
-    // Regel 3: Ab 3 Bestätigungen wird es offiziell verifiziert
+    // Dem Bestätiger 10 XP gutschreiben
+    await User.updateOne({ usernameLower: userName.toLowerCase() }, { $inc: { xp: 10 } });
+
+    // Regel 3: Ab 3 Bestätigungen wird verifiziert -> 50 XP Bonus für den Ersteller
     if (restaurant.customHours.confirmations.length >= 3) {
       restaurant.customHours.status = 'verified';
-      restaurant.openingHours = restaurant.customHours.hoursText; // Dauerhaft übernehmen
+      restaurant.openingHours = restaurant.customHours.hoursText;
+
+      await User.updateOne(
+        { usernameLower: restaurant.customHours.proposedBy.toLowerCase() },
+        { $inc: { xp: 50 } }
+      );
     }
 
     await restaurant.save();
