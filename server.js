@@ -555,6 +555,10 @@ app.post('/api/places/confirm-hours', async (req, res) => {
   }
 });
 
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
 // ================= SERVER START =================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FoodMatch läuft stabil auf Port ${PORT}`));
