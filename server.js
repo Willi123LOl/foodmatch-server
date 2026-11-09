@@ -43,6 +43,7 @@ const restaurantSchema = new mongoose.Schema({
   rating: { type: Number, default: 4.3 },
   hasParking: { type: Boolean, default: false },
   openingHours: { type: String, default: '' },
+  imageUrl: { type: String, default: '' },
   searchKeywords: { type: String, default: '' },
   customHours: {
     hoursText: { type: String, default: '' },
@@ -419,6 +420,7 @@ app.get('/api/places', async (req, res) => {
         id: d.osmId || d._id.toString(),
         lat: d.location.coordinates[1],
         lon: d.location.coordinates[0],
+        imageUrl: d.imageUrl || null,
         customHours: d.customHours && d.customHours.status !== 'none' ? d.customHours : null,
         tags: {
           name: d.name,
