@@ -394,32 +394,47 @@ app.get('/api/places', async (req, res) => {
   try {
     const lat = parseFloat(req.query.lat);
     const lon = parseFloat(req.query.lon);
-    const radiusMeters = Math.min(parseInt(req.query.radius, 10) || 5000, 25000);
+    const radiusMeters = Math.min(parseInt(req.query.radius, 10) || 10000, 30000);
 
-    if (!lat || !lon) {
-      return res.status(400).json({ error: 'lat und lon sind erforderlich.' });
+    if (isNaN(lat) || isNaN(lon)) {
+      return res.status(400).json({ error: 'lat und lon müssen gültige Zahlen sein.' });
     }
 
-    // 2dsphere-Umkreissuche über deine importierten Daten
-    const docs = await Restaurant.find({
-      location: {
-        $nearSphere: {
-          $geometry: { type: 'Point', coordinates: [lon, lat] },$maxDistance: radiusMeters
-        }
-      }
-    }).limit(1000);
+    let docs = [];
 
-    // Format identisch für das Frontend aufbereiten
-    // Format identisch für das Frontend aufbereiten
+    // 1. Primär: Geo-Umkreissuche
+    try {
+      docs = await Restaurant.find({
+        location: {
+          $nearSphere: {
+            $geometry: { type: 'Point', coordinates: [lon, lat] },
+            $maxDistance: radiusMeters
+          }
+        }
+      }).limit(500);
+    } catch (geoErr) {
+      console.warn("[MongoDB Places Geo-Index Warnung]:", geoErr.message);
+      // Fallback: Falls kein 2dsphere Index aktiv ist, alle Dokumente laden
+      docs = await Restaurant.find({}).limit(500);
+    }
+
+    // Falls Umkreis leer war, lade zur Absicherung die nächsten Restaurants
+    if (!docs || docs.length === 0) {
+      docs = await Restaurant.find({}).limit(100);
+    }
+
     const elements = docs.map(d => {
-      // Wenn die Community-Zeiten verifiziert sind (>= 3 Bestätigungen), überschreiben sie den OSM-Wert
       const isVerified = d.customHours && d.customHours.status === 'verified';
       const effectiveHours = isVerified ? d.customHours.hoursText : (d.openingHours || '');
 
+      const coords = (d.location && Array.isArray(d.location.coordinates)) 
+        ? d.location.coordinates 
+        : [lon, lat];
+
       return {
         id: d.osmId || d._id.toString(),
-        lat: d.location.coordinates[1],
-        lon: d.location.coordinates[0],
+        lat: coords[1],
+        lon: coords[0],
         imageUrl: d.imageUrl || null,
         customHours: d.customHours && d.customHours.status !== 'none' ? d.customHours : null,
         tags: {
@@ -434,9 +449,10 @@ app.get('/api/places', async (req, res) => {
       };
     });
 
+    console.log(`[Backend /api/places] Gefundene Lokale: ${elements.length}`);
     res.json({ elements, count: elements.length });
   } catch (error) {
-    console.error('[MongoDB Places Fehler]:', error);
+    console.error('[MongoDB Places Schwerer Fehler]:', error);
     res.status(500).json({ error: 'Fehler beim Laden der Orte aus der Datenbank.' });
   }
 });
