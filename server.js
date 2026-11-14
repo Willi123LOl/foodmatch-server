@@ -295,23 +295,7 @@ app.post('/api/user/respond-friend-request', async (req, res) => {
 
 // ================= LOBBYS & ECHTZEIT =================
 
-app.post('/api/lobby/create', (req, res) => {
-  const { hostName, lat, lon, radiusKm = 5 } = req.body;
-  const code = Math.floor(1000 + Math.random() * 9000).toString();
 
-  const lobby = {
-    code,
-    hostName,
-    lat,
-    lon,
-    radiusKm,
-    participants: [{ name: hostName, ready: false, answers: [] }],
-    status: 'waiting'
-  };
-
-  lobbies.set(code, lobby);
-  res.json({ success: true, code, lobby });
-});
 
 app.post('/api/lobby/join', (req, res) => {
   const { code, userName } = req.body;
@@ -330,11 +314,6 @@ app.get('/api/lobby/status/:code', (req, res) => {
   res.json({ lobby });
 });
 
-app.post('/api/lobby/start', (req, res) => {
-  const lobby = lobbies.get(req.body.code);
-  if (lobby) lobby.status = 'playing';
-  res.json({ success: true });
-});
 
 app.post('/api/lobby/invite', async (req, res) => {
   try {
@@ -372,18 +351,91 @@ app.post('/api/lobby/respond-invite', async (req, res) => {
     res.status(500).json({ error: 'Fehler bei Einladungsantwort' });
   }
 });
+// 1. Lobby erstellen (unterstützt jetzt 'akinator' und 'battle')
+app.post('/api/lobby/create', (req, res) => {
+  const { hostName, lat, lon, radiusKm = 5, mode = 'akinator' } = req.body;
+  const code = Math.floor(1000 + Math.random() * 9000).toString();
 
+  const lobby = {
+    code,
+    hostName,
+    lat,
+    lon,
+    radiusKm,
+    mode, // 'akinator' oder 'battle'
+    participants: [{ name: hostName, ready: false, answers: [], battleLikes: [] }],
+    status: 'waiting',
+    battleWinnerId: null
+  };
+
+  lobbies.set(code, lobby);
+  res.json({ success: true, code, lobby });
+});
+
+// 2. Lobby starten
+app.post('/api/lobby/start', (req, res) => {
+  const { code, mode } = req.body;
+  const lobby = lobbies.get(code);
+  if (lobby) {
+    lobby.status = 'playing';
+    if (mode) lobby.mode = mode;
+  }
+  res.json({ success: true });
+});
+
+// 3. Antworten / Likes einreichen (unterstützt BATTLE_LIKE für die Top 3 Auswertung)
 app.post('/api/lobby/submit', (req, res) => {
   const lobby = lobbies.get(req.body.code);
   if (!lobby) return res.status(404).json({ error: 'Fehlt' });
 
   const p = lobby.participants.find(x => x.name === req.body.userName);
-  if (p) { p.answers = req.body.answers; p.ready = true; }
+  if (p) {
+    p.answers = req.body.answers;
+    p.ready = true;
 
+    // Falls Local Battle: Likes direkt in das battleLikes-Array spiegeln
+    if (!p.battleLikes) p.battleLikes = [];
+    (req.body.answers || []).forEach(a => {
+      if (a.feature === 'BATTLE_LIKE' && a.targetVal && !p.battleLikes.includes(String(a.targetVal))) {
+        p.battleLikes.push(String(a.targetVal));
+      }
+    });
+  }
+
+  // Wenn alle Spieler bereit sind, schaltet die Lobby auf 'finished'
   if (lobby.participants.every(x => x.ready)) {
     lobby.status = 'finished';
   }
   res.json({ success: true, lobby });
+});
+
+// Live-Like im Local Battle Modus prüfen
+app.post('/api/lobby/battle-like', async (req, res) => {
+  const { code, userName, placeId } = req.body;
+  const lobby = lobbies[code]; // oder dein MongoDB Lobby.findOne({ code })
+  if (!lobby) return res.status(404).json({ error: 'Lobby nicht gefunden' });
+
+  const player = lobby.participants.find(p => p.name === userName);
+  if (player) {
+    if (!player.battleLikes) player.battleLikes = [];
+    if (!player.battleLikes.includes(placeId)) {
+      player.battleLikes.push(placeId);
+    }
+  }
+
+  // Prüfen, ob ALLE Teilnehmer dieses Lokal geliked haben
+  const allLiked = lobby.participants.length > 0 &&
+    lobby.participants.every(p => Array.isArray(p.battleLikes) && p.battleLikes.includes(placeId));
+
+  if (allLiked) {
+    lobby.battleWinnerId = placeId;
+    lobby.status = 'finished';
+    // Falls MongoDB: await lobby.save();
+    return res.json({ matched: true, placeId });
+  }
+
+  // Falls MongoDB: await lobby.save();
+  res.json({ matched: false });
 });
 
 // ==========================================
