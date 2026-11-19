@@ -448,7 +448,7 @@ app.post('/api/lobby/submit', (req, res) => {
 // Live-Like im Local Battle Modus prüfen
 app.post('/api/lobby/battle-like', async (req, res) => {
   const { code, userName, placeId } = req.body;
-  const lobby = lobbies[code]; // oder dein MongoDB Lobby.findOne({ code })
+  const lobby = lobbies.get(code); // oder dein MongoDB Lobby.findOne({ code })
   if (!lobby) return res.status(404).json({ error: 'Lobby nicht gefunden' });
 
   const player = lobby.participants.find(p => p.name === userName);
