@@ -83,6 +83,29 @@ function hashPassword(password) {
 function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
+// Prüft auf ungültige Zeichen und illegale/beleidigende Begriffe
+function validateUsername(name) {
+  const clean = (name || '').trim();
+  if (clean.length < 3 || clean.length > 20) {
+    return 'Der Name muss zwischen 3 und 20 Zeichen lang sein.';
+  }
+  if (!/^[a-zA-Z0-9äöüÄÖÜß._-]+$/.test(clean)) {
+    return 'Nur Buchstaben, Zahlen, Punkt, Unterstrich und Bindestrich erlaubt.';
+  }
+
+  const lower = clean.toLowerCase();
+  const forbiddenWords = [
+    'admin', 'administrator', 'support', 'moderator', 'foodmatch', 'system', 'gast',
+    'hitler', 'nazi', 'nsdap', 'isis', 'terror', 'hurensohn', 'wichser', 'fotze',
+    'arschloch', 'missgeburt', 'schwuchtel', 'neger', 'nigger', 'nutte', 'schlampe',
+    'vergewaltigung', 'pädophil', 'kill', 'mord', 'porn', 'sex'
+  ];
+
+  if (forbiddenWords.some(word => lower.includes(word))) {
+    return 'Dieser Benutzername ist unzulässig oder reserviert.';
+  }
+  return null;
+}
 
 // ================= AUTH ROUTEN =================
 
@@ -90,8 +113,14 @@ function generateToken() {
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, password } = req.body;
-    if (!username || !password || password.length < 4) {
-      return res.status(400).json({ error: 'Name und Passwort (mind. 4 Zeichen) eingeben.' });
+
+    const nameError = validateUsername(username);
+    if (nameError) {
+      return res.status(400).json({ error: nameError });
+    }
+
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: 'Das Passwort muss mindestens 6 Zeichen lang sein.' });
     }
 
     const cleanName = username.trim();
@@ -99,7 +128,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     const existingUser = await User.findOne({ usernameLower: key });
     if (existingUser) {
-      return res.status(400).json({ error: 'Dieser Name ist bereits vergeben.' });
+      return res.status(400).json({ error: 'Dieser Benutzername ist bereits vergeben.' });
     }
 
     const newUser = await User.create({
@@ -116,7 +145,7 @@ app.post('/api/auth/register', async (req, res) => {
     res.json({
       success: true,
       token,
-      user: { username: newUser.username, friends: [], friendRequests: [] }
+      user: { username: newUser.username, xp: 0, friends: [], friendRequests: [] }
     });
   } catch (err) {
     console.error("Registrierungsfehler:", err);
@@ -155,6 +184,70 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) {
     console.error("Loginfehler:", err);
     res.status(500).json({ error: 'Serverfehler beim Login.' });
+  }
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ error: 'Kein Google-Token übermittelt.' });
+
+    // Token direkt bei Google verifizieren
+    const gRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+    if (!gRes.ok) {
+      return res.status(401).json({ error: 'Google-Anmeldung ungültig.' });
+    }
+    const payload = await gRes.json();
+    const email = (payload.email || '').toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Keine E-Mail von Google erhalten.' });
+
+    // Basis-Namen aus Google-Profil bereinigen
+    let baseName = (payload.given_name || email.split('@')[0] || 'User')
+      .replace(/[^a-zA-Z0-9äöüÄÖÜß._-]/g, '')
+      .slice(0, 15);
+
+    if (baseName.length < 3 || validateUsername(baseName)) {
+      baseName = 'Foodie';
+    }
+
+    // Prüfen, ob für diese Google-Mail schon ein Account existiert (über googleEmail oder hash)
+    const googlePasswordHash = hashPassword('GOOGLE_OAUTH_' + payload.sub);
+    let user = await User.findOne({ passwordHash: googlePasswordHash });
+
+    if (!user) {
+      // Eindeutigen Namen garantieren (keine doppelten Namen)
+      let candidate = baseName;
+      let counter = 1;
+      while (await User.findOne({ usernameLower: candidate.toLowerCase() })) {
+        candidate = `${baseName}${counter}`;
+        counter++;
+      }
+
+      user = await User.create({
+        username: candidate,
+        usernameLower: candidate.toLowerCase(),
+        passwordHash: googlePasswordHash,
+        friends: [],
+        friendRequests: []
+      });
+    }
+
+    const token = generateToken();
+    activeTokens.set(token, user.username);
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        username: user.username,
+        xp: user.xp || 0,
+        friends: user.friends || [],
+        friendRequests: user.friendRequests || []
+      }
+    });
+  } catch (err) {
+    console.error('Google-Auth-Fehler:', err);
+    res.status(500).json({ error: 'Fehler bei der Google-Anmeldung.' });
   }
 });
 
