@@ -23,7 +23,8 @@ const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   usernameLower: { type: String, required: true, unique: true },
   passwordHash: { type: String, required: true },
-  xp: { type: Number, default: 0 }, // <-- HIER ERGÄNZEN
+  xp: { type: Number, default: 0 },
+  lastSeen: { type: Date, default: null },// <-- HIER ERGÄNZEN
   friends: { type: [String], default: [] },
   friendRequests: { type: [String], default: [] },
   activeInvite: { type: Object, default: null }
@@ -192,19 +193,54 @@ app.get('/api/auth/me', async (req, res) => {
 
 app.post('/api/user/sync', async (req, res) => {
   try {
-    const { userName = 'Gast' } = req.body;
-    const key = userName.toLowerCase();
+    const { userName = 'Gast', isOnline = true } = req.body;
+    const key = userName.toLowerCase().trim();
 
     let user = await User.findOne({ usernameLower: key });
 
     if (!user) {
       return res.json({
-        user: { username: userName, friends: [], friendRequests: [], activeInvite: null }
+        user: {
+          username: userName,
+          friends: [],
+          friendsStatus: {},
+          friendRequests: [],
+          activeInvite: null
+        }
       });
     }
 
-    res.json({ user });
+    // Eigenen Zeitstempel aktualisieren, wenn als online gemeldet
+    if (isOnline && !key.startsWith('gast_')) {
+      user.lastSeen = new Date();
+      await user.save();
+    }
+
+    // Online-Status aller Freunde laden (aktiv, wenn lastSeen < 30 Sekunden alt)
+    const friendsStatus = {};
+    if (Array.isArray(user.friends) && user.friends.length > 0) {
+      const friendKeys = user.friends.map(f => f.toLowerCase().trim());
+      const friendDocs = await User.find({ usernameLower: { $in: friendKeys } });
+      const now = Date.now();
+
+      friendDocs.forEach(fd => {
+        const seenMs = fd.lastSeen ? new Date(fd.lastSeen).getTime() : 0;
+        const online = seenMs > 0 && (now - seenMs < 30000);
+        friendsStatus[fd.username] = {
+          isOnline: online,
+          lastSeen: fd.lastSeen
+        };
+      });
+    }
+
+    res.json({
+      user: {
+        ...user.toObject(),
+        friendsStatus
+      }
+    });
   } catch (err) {
+    console.error('Sync-Fehler:', err);
     res.status(500).json({ error: 'Sync-Fehler' });
   }
 });
